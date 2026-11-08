@@ -3,8 +3,7 @@
 # under sudo in their own step; nothing in either step executes code other than this repository's tests.
 name: tests
 on:
-  pull_request:
-    branches: [main]
+  pull_request: # every PR: the ruleset targets the default branch, whatever it is called
   push:
     branches: [main]
 permissions:

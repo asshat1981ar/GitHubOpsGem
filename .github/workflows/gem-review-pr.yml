@@ -6,8 +6,7 @@
 # change under .github/ to the owner, who reviews those diffs before merging.
 name: gem-review
 on:
-  pull_request:
-    branches: [main]
+  pull_request: # every PR: the ruleset targets the default branch, whatever it is called
 permissions:
   contents: read # checkout of the PR head and of the gem at the base commit
   pull-requests: read # PR metadata only; nothing is written back

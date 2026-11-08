@@ -433,7 +433,8 @@ def test_installed_reusable_workflow_is_the_tested_source():
 
 def test_self_caller_is_hardened_and_reviews_with_the_base_commit():
     w = load(SELF_CALLER)
-    assert set(w[True]) == {"pull_request"} and "pull_request_target" not in SELF_CALLER.read_text()
+    assert set(w[True]) == {"pull_request"} and w[True]["pull_request"] is None   # every PR
+    assert "pull_request_target" not in SELF_CALLER.read_text()
     assert w["permissions"] == {"contents": "read", "pull-requests": "read"}
     (name, job), = jobs(w)
     assert job["uses"] == "./.github/workflows/gem-review.yml"   # same commit as the caller (see file comment)
@@ -482,7 +483,9 @@ def test_tests_workflow_is_hardened():
         if "run" in step:
             assert "${{" not in step["run"]
             if "pip install" in step["run"]:
-                pkgs = [t for t in step["run"].split() if "==" in t]
-                assert len(pkgs) == 6, pkgs                          # every tool pinned to an exact version
-    checkout = [s for s in job["steps"] if "checkout" in s.get("uses", "")][0]
-    assert checkout["with"]["persist-credentials"] is False
+                args = step["run"].split("install", 1)[1].split()
+                pkgs = [a for a in args if not a.startswith("-")]
+                assert pkgs and all(re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][0-9A-Za-z.]*", p) for p in pkgs), pkgs
+    checkouts = [s for s in job["steps"] if "actions/checkout" in s.get("uses", "")]
+    assert checkouts and all(s.get("with", {}).get("persist-credentials") is False for s in checkouts)
+    assert set(w[True]) == {"pull_request", "push"} and w[True]["pull_request"] is None   # every PR
