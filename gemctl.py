@@ -13,10 +13,15 @@ Exit codes: 0 = ok / PASS / WARN, 2 = BLOCK or verification failed, 1 = usage or
   gemctl strip      [--assume-open] < text                   remove <think> reasoning (text)
   gemctl verify     --attestation FILE|-                      ask ForgeCore whether an attestation is valid
   gemctl heavy      on [--wait 600] [--export] | off | status  wake / sleep the 4xB200 burst deployment (WU-07)
+  gemctl trailer    add MSG_FILE | note [COMMIT] | verify RANGE | install-hook [--repo PATH]
+                                                             Gem-Gate commit trailers + git-notes (WU-09b)
   gemctl version
 
 `gemctl heavy on` exits 2 when the controller refuses (spend cap or deployment guard) and 3 when the B200 is
 still warming after --wait seconds; keep working on ds-main either way.
+
+`gemctl trailer` notes live under refs/notes/gem-gate and `git push` does not send them:
+git push origin refs/notes/gem-gate
 """
 
 from __future__ import annotations
@@ -185,6 +190,46 @@ def cmd_heavy(a: argparse.Namespace) -> int:
         return 1
 
 
+TRAILER_HELP = """Gem-Gate commit trailers backed by ForgeCore attestations (WU-09b, see gem_trailers.py).
+
+  gemctl trailer install-hook [--repo PATH]  write the commit-msg hook (.git/hooks or core.hooksPath);
+                                             an existing non-gem hook is kept and chained, never clobbered
+  gemctl trailer add MSG_FILE                what the hook runs: append Gem-Gate: <attestation_id> for the
+                                             newest PASS/WARN attestation of this repo + branch (<15 min old);
+                                             none found: note on stderr, exit 0 (exit 1 if GEM_TRAILER_REQUIRED=1)
+  gemctl trailer note [COMMIT]               attach the stored attestation for COMMIT's trailer (default HEAD)
+                                             as a git note under refs/notes/gem-gate
+  gemctl trailer verify RANGE                JSON report per commit, e.g. RANGE=origin/main..HEAD;
+                                             exit 0 all verified, 2 blocked/invalid/mismatch, 1 missing/unavailable
+
+Notes are NOT pushed by `git push`. Publish them with:  git push origin refs/notes/gem-gate
+and fetch them before verifying elsewhere:              git fetch origin refs/notes/gem-gate:refs/notes/gem-gate
+verify needs AUTODEV_URL (or GEM_FORGECORE_URL) and AUTODEV_API_BEARER_TOKEN; repository = GEM_REPOSITORY or origin.
+"""
+
+
+def cmd_trailer(a: argparse.Namespace) -> int:
+    import gem_trailers as gt
+
+    if a.action == "add":
+        return gt.add_trailer(a.msg_file)
+    if a.action == "note":
+        sha, att_id = gt.attach_note_from_store(a.commit)
+        sys.stderr.write(f"gem-gate: attestation {att_id} attached to {sha[:12]} under {gt.NOTES_REF}. "
+                         f"Publish it with: git push origin {gt.NOTES_REF}\n")
+        return 0
+    if a.action == "verify":
+        att = gem.ForgeCoreAttestor.from_env()
+        if att is None:
+            sys.stderr.write("gemctl trailer verify: ForgeCore not configured (AUTODEV_URL or GEM_FORGECORE_URL, "
+                             "plus AUTODEV_API_BEARER_TOKEN); signatures cannot be checked\n")
+        report = gt.verify_range(a.rev_range, att)
+        _emit(report)
+        return gt.exit_code(report)
+    _emit(gt.install_hook(a.repo, gemctl_path=os.path.abspath(__file__), python=sys.executable))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gemctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -212,6 +257,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("heavy"); s.add_argument("action", choices=["on", "off", "status"])
     s.add_argument("--wait", type=int, default=600); s.add_argument("--poll", type=float, default=10.0)
     s.add_argument("--export", action="store_true"); s.set_defaults(fn=cmd_heavy)
+
+    s = sub.add_parser("trailer", help="Gem-Gate commit trailers + git notes (push: git push origin refs/notes/gem-gate)",
+                       description=TRAILER_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    t = s.add_subparsers(dest="action", required=True)
+    t.add_parser("add", help="append the Gem-Gate trailer (commit-msg hook)").add_argument("msg_file")
+    t.add_parser("note", help="attach the stored attestation as a git note under refs/notes/gem-gate; "
+                 "push with: git push origin refs/notes/gem-gate").add_argument("commit", nargs="?", default="HEAD")
+    t.add_parser("verify", help="verify every commit in RANGE (needs refs/notes/gem-gate fetched)"
+                 ).add_argument("rev_range", metavar="RANGE")
+    t.add_parser("install-hook", help="write the commit-msg hook").add_argument("--repo", default=".")
+    s.set_defaults(fn=cmd_trailer)
 
     s = sub.add_parser("version"); s.set_defaults(fn=lambda a: (sys.stdout.write(gem.__version__ + "\n"), 0)[1])
     return p

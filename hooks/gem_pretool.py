@@ -22,6 +22,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -186,6 +187,33 @@ def log_event(record: Dict[str, Any]) -> None:
         pass  # logging must never change a gate decision
 
 
+def store_attestation(att: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Keep the full attestation at $GEM_HOME/attestations/<id>.json for `gemctl trailer` (WU-09b).
+    Atomic, owner-only (file 0600, dir 0700). Fail-open: storage must never change a gate decision."""
+    try:
+        att_id = str((att or {}).get("attestation_id") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", att_id):
+            return None
+        folder = os.path.join(GEM_HOME, "attestations")
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        os.chmod(folder, 0o700)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=folder)  # mkstemp creates 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(att, fh, sort_keys=True)
+            path = os.path.join(folder, att_id + ".json")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return path
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def gate_one(write: Dict[str, Any], session_id: str, repo: str) -> "gem.GateDecision":
     mon = gem.StatefulGitHubOpsMonitor(repository=repo, session_id=session_id)
     return mon.evaluate_write(write["tool"], write["branch"], action_event=write.get("event"),
@@ -244,6 +272,7 @@ def main() -> int:
             "session": session_id, "repo": repo, "tool": gd.tool_name, "target": gd.target_branch,
             "decision": gd.decision, "mode": gd.mode.value, "rules": rule_ids(gd.violations),
             "attestation_id": (gd.attestation or {}).get("attestation_id"),
+            "attestation_path": store_attestation(gd.attestation) if gd.attestation else None,
             "detail_sha256": hashlib.sha256("|".join(gd.violations).encode()).hexdigest()[:16],
             "user_override": False,
         })
