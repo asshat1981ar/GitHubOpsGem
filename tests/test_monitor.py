@@ -478,7 +478,7 @@ def test_unicode_line_separators_do_not_hide_added_lines(sep):
     patch = f"--- a/x.py\n+++ b/x.py\n@@ -0,0 +1,2 @@\n+a = 1{sep}{tok}\n+b = 2\n"
     lines = list(m.iter_patch_lines(patch))
     assert [l.kind for l in lines] == ["add", "add"]
-    assert tok in lines[0].text
+    assert tok in lines[0].content
 
 
 def test_scan_diff_catches_token_behind_line_separator(tmp_path):
@@ -494,4 +494,4 @@ def test_scan_diff_catches_token_behind_line_separator(tmp_path):
 
 def test_crlf_patches_still_parse():
     patch = "--- a/x.py\r\n+++ b/x.py\r\n@@ -1,1 +1,2 @@\r\n ctx\r\n+new\r\n"
-    assert [(l.kind, l.text) for l in m.iter_patch_lines(patch)] == [("ctx", "ctx"), ("add", "new")]
+    assert [(l.kind, l.content) for l in m.iter_patch_lines(patch)] == [("ctx", "ctx"), ("add", "new")]
