@@ -80,9 +80,9 @@ class _ForgeCore(BaseHTTPRequestHandler):
             return self._reply(201, att)
         if self.path == "/api/v1/gate/verify":
             st["verify_calls"] += 1
-            att = body.get("attestation")
-            if not isinstance(att, dict):
-                return self._reply(400, {"error": "body must be {\"attestation\": {...}}"})
+            att = body                                   # like autodev-server: Json<GateAttestation>, bare
+            if not isinstance(att, dict) or "attestation" in att or "signature" not in att:
+                return self._reply(422, {"error": "body must be a bare GateAttestation"})
             unsigned = {k: v for k, v in att.items() if k != "signature"}
             base = {k: v for k, v in unsigned.items() if k != "attestation_id"}
             valid = (isinstance(att.get("signature"), str) and hmac.compare_digest(att["signature"], _sign(unsigned))
@@ -230,7 +230,7 @@ def test_hook_stores_full_attestation_owner_only(forgecore, isolated, tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
     assert not [f for f in os.listdir(os.path.dirname(path)) if f.startswith(".tmp-")]
-    assert gem.ForgeCoreAttestor(forgecore.url, TOKEN).verify({"attestation": att}) == {"valid": True, "recorded": True}
+    assert gem.ForgeCoreAttestor(forgecore.url, TOKEN).verify(att) == {"valid": True, "recorded": True}
 
 
 def test_hook_storage_failure_never_changes_decision(forgecore, isolated, tmp_path):

@@ -363,7 +363,7 @@ def _verify_commit(sha: str, values: List[str], attestor: Any, repository: str, 
     key = _canonical(att)
     if key not in cache:
         try:
-            result = attestor.verify({"attestation": att})
+            result = attestor.verify(att)          # ForgeCore takes the bare GateAttestation (Json<GateAttestation>)
         except gem.ForgeCoreUnavailable as exc:
             if not isinstance(exc.__cause__, urllib.error.HTTPError):
                 down.append(str(exc))
