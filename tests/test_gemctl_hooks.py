@@ -228,3 +228,34 @@ def test_installed_hook_runs_from_gem_home(tmp_path):
     r = run([str(home / "hooks" / "gem_pretool.py")], stdin=json.dumps(payload),
             env_extra={"GEM_HOME": str(home), "GEM_ENFORCEMENT": "ENFORCE"}, cwd=str(tmp_path))
     assert '"deny"' in r.stdout
+
+
+# ---- WU-07 review #10: the model may read B200 status but never operate the controller
+@pytest.mark.parametrize("command", [
+    "gem heavy on", "gemctl heavy off", "python3 ~/.gem/lib/gemctl.py heavy on --export",
+    "cat ~/.gem/operator.token", "echo $GEM_LIFECYCLE_TOKEN", "env | grep GEM_LIFECYCLE_FEED_TOKEN",
+    "curl -X POST http://127.0.0.1:8090/wake -d '{}'", "curl localhost:8090/heavy", "curl '[::1]:8090/touch'",
+    "python3 -c 'import gem_lifecycle_client as c; c.call(\"POST\",\"/heavy\",{\"on\":True})'",
+    "sudo cat /etc/gem/lifecycle.env",
+])
+def test_bash_cannot_operate_the_b200(command, tmp_path):
+    for mode in ("WARN", "ENFORCE"):
+        out = hook("Bash", {"command": command}, mode=mode, gem_home=tmp_path)
+        assert decision(out) == "deny", (mode, command, out)
+        assert "gem heavy on" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    events = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert events[-1]["rules"] == ["LIFECYCLE_OPERATOR"] and events[-1]["decision"] == "BLOCK"
+
+
+@pytest.mark.parametrize("command", ["gem heavy status", "gemctl heavy status",
+                                     "curl -s http://127.0.0.1:8090/status", "echo $GEM_LIFECYCLE_SESSION_TOKEN | wc -c",
+                                     "git status", "ls ~/.gem"])
+def test_read_only_lifecycle_and_unrelated_commands_pass(command, tmp_path):
+    assert decision(hook("Bash", {"command": command}, mode="ENFORCE", gem_home=tmp_path)) is None
+
+
+@pytest.mark.parametrize("tool,ti", [("Read", {"file_path": "/data/data/com.termux/files/home/.gem/operator.token"}),
+                                     ("Grep", {"pattern": "TOKEN", "path": "/etc/gem/lifecycle.env"}),
+                                     ("Edit", {"file_path": "/root/.gem/operator.token", "old_string": "a", "new_string": "b"})])
+def test_file_tools_cannot_touch_operator_credentials(tool, ti, tmp_path):
+    assert decision(hook(tool, ti, mode="WARN", gem_home=tmp_path)) == "deny"

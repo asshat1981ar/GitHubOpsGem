@@ -241,6 +241,38 @@ def respond(decisions: List["gem.GateDecision"], tool_name: str) -> Dict[str, An
     return {}
 
 
+# --------------------------------------------------------------------------- B200 operator guard (WU-07 review #10)
+# The model may read B200 status, never operate it: waking the 4xB200 bills about $52/h. Always enforced,
+# like outbound secrets, whatever the warn/enforce mode. Defense in depth: the operator token also lives in a
+# 0600 file the hooks never export, and the controller limits each token to its role.
+LIFECYCLE_BASH = [
+    (re.compile(r"operator\.token"), "reads the B200 operator token"),
+    (re.compile(r"\bGEM_LIFECYCLE_(?:FEED_)?TOKEN\b"), "uses a B200 controller token"),
+    (re.compile(r"\b(?:gem|gemctl(?:\.py)?)\s+heavy\s+(?:on|off)\b"), "switches the B200 on or off"),
+    (re.compile(r"(?:127\.0\.0\.1|localhost|\[::1\]):8090/(?:wake|sleep|heavy|touch|signal|session|check)"),
+     "calls a B200 controller write endpoint"),
+    (re.compile(r"\bgem_lifecycle_client\b"), "drives the B200 controller client directly"),
+    (re.compile(r"/etc/gem/lifecycle\.env"), "reads the controller's secrets file"),
+]
+LIFECYCLE_PATHS = re.compile(r"operator\.token|/etc/gem/lifecycle\.env")
+
+
+def lifecycle_guard(event: Dict[str, Any]) -> Optional[str]:
+    """Reason to deny if this tool call would operate the B200 or read its operator credentials."""
+    tool = str(event.get("tool_name", ""))
+    ti = event.get("tool_input") or {}
+    if tool == "Bash":
+        cmd = str(ti.get("command", ""))
+        for rx, what in LIFECYCLE_BASH:
+            if rx.search(cmd):
+                return what
+    elif tool in ("Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit"):
+        target = " ".join(str(ti.get(k, "")) for k in ("file_path", "path", "pattern", "notebook_path"))
+        if LIFECYCLE_PATHS.search(target):
+            return "touches the B200 operator credentials"
+    return None
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
@@ -252,6 +284,18 @@ def main() -> int:
         if mode == gem.EnforcementMode.ENFORCE and re.search(r"git\s+push|mcp__\w*github", raw):
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                      "permissionDecisionReason": f"Hook error, failing closed: {exc}"}}))
+        return 0
+    why = lifecycle_guard(event)
+    if why:
+        log_event({"ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "side": "hook",
+                   "session": str(event.get("session_id") or "unknown"), "repo": _repo_slug(event.get("cwd")),
+                   "tool": str(event.get("tool_name", "")), "target": "b200-controller", "decision": "BLOCK",
+                   "mode": "ALWAYS", "rules": ["LIFECYCLE_OPERATOR"], "user_override": False})
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": (f"GEM: this {why}. Only the user operates the 4xB200 burst deployment "
+                                         "(about $52/h). Ask them to run `gem heavy on` themselves; `gem heavy "
+                                         "status` is fine to run.")}}))
         return 0
     if not writes:
         return 0
