@@ -450,7 +450,9 @@ def test_ruleset_requires_the_check_that_actually_runs():
     expected = f"{caller_job} / {callee_job}"
     main = json.loads((ROOT / "ci" / "rulesets" / "main.json").read_text())
     checks = [r for r in main["rules"] if r["type"] == "required_status_checks"][0]["parameters"]["required_status_checks"]
-    assert checks == [{"context": expected, "integration_id": 15368}]          # 15368 = GitHub Actions
+    assert checks[0] == {"context": expected, "integration_id": 15368}          # 15368 = GitHub Actions
+    tests_job = load(ROOT / ".github" / "workflows" / "tests.yml")["jobs"]["pytest"]["name"]
+    assert checks[1:] == [{"context": tests_job, "integration_id": 15368}]
     types = {r["type"] for r in main["rules"]}
     assert {"deletion", "non_fast_forward", "pull_request", "required_status_checks"} <= types
     assert all(b["bypass_mode"] == "pull_request" for b in main["bypass_actors"])  # no direct-push bypass
@@ -460,9 +462,27 @@ def test_ruleset_requires_the_check_that_actually_runs():
 
 
 def test_new_workflow_files_pass_actionlint_and_zizmor():
-    files = [str(INSTALLED), str(SELF_CALLER)]
+    files = sorted(str(p) for p in (ROOT / ".github" / "workflows").glob("*.yml"))
+    assert len(files) == 3
     r = subprocess.run([_tool("actionlint"), "-no-color", *files], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
                        text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_tests_workflow_is_hardened():
+    w = load(ROOT / ".github" / "workflows" / "tests.yml")
+    assert w["permissions"] == {"contents": "read"} and "pull_request_target" not in str(w[True])
+    job = w["jobs"]["pytest"]
+    assert job["permissions"] == {"contents": "read"} and 0 < job["timeout-minutes"] <= 30
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", step["uses"]), step["uses"]
+        if "run" in step:
+            assert "${{" not in step["run"]
+            if "pip install" in step["run"]:
+                pkgs = [t for t in step["run"].split() if "==" in t]
+                assert len(pkgs) == 6, pkgs                          # every tool pinned to an exact version
+    checkout = [s for s in job["steps"] if "checkout" in s.get("uses", "")][0]
+    assert checkout["with"]["persist-credentials"] is False
