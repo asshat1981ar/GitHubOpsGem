@@ -41,6 +41,10 @@ first, 4×B200 burst), with ForgeCore-signed gates, spend caps, and evidence for
 - Enumerate every path that can start a billable resource, including the provider's autoscaler.
 - Seed state from the first read; key restart logic on "first tick of this process".
 - A scratch-root test must recreate system directory permissions or it proves less than it seems.
+- A stand-in must parse like the real component (systemd EnvironmentFile ≠ `sh`), or it agrees with the bug.
+- Check every interface claim in a sub-agent brief against the real code first (the `/verify` body shape miss).
+- Never pipe a gate command into `tail` before `&&`: capture the exit code (`cmd > log; rc=$?`) or `set -o pipefail`.
+- Anything that meters money persists every input across restarts, fsyncs, and fails toward capped.
 
 ## Bindings
 | Need | Use |

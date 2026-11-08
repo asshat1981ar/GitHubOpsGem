@@ -11,12 +11,12 @@
 | WU-02 | gemcore v5.1 patch + regression suite | bash/pytest | WU-01 | 80 tests pass; probes 0/19 on v5.1, 19/19 on v5 | ✅ |
 | WU-03 | Gateway config v6 + client env (draft) | bash | WU-01 | YAML parses; aliases cover every CLAUDE tier; conformance (WU-06) | 🟡 |
 | WU-04 | `gemctl` CLI | bash/pytest | WU-02 | subcommands JSON/exit-code tested; stdlib only | ✅ |
-| WU-05 | LiteLLM `gem_guardrail.py` plugin | bash + Context7 (LiteLLM docs) | WU-02, WU-03 | unit tests with mocked streams; litellm boots with guardrail | 🟢 |
+| WU-05 | LiteLLM `gem_guardrail.py` plugin | sub-agent + LiteLLM 1.108.2 source | WU-02, WU-03 | unit tests with mocked streams; litellm boots with guardrail | ✅ (36 tests; both routes; live proxy pending) |
 | WU-06 | Gateway conformance harness (= PRO-78 open criterion: live smoke on AutoDev + Chimera worktrees) | bash on awsbox (human runs) | WU-03, WU-05 | 6/6 checks green against live gateway on both worktrees | ⬜ |
 | WU-07 | Deployment lifecycle controller | bash + systemd + LiteLLM callback | WU-04 | dry-run: idle 3m→sleep, SessionEnd+45s→sleep, cap trips, auto-delete guard | ✅ (dry-run 9/9; live run on awsbox pending) |
 | WU-08 | Claude Code policy hooks (Termux) | bash | WU-04, WU-07 | hook tests: push main WARN/BLOCK, MCP write gated, wake/sleep fired | ⬜ |
 | WU-09 | ForgeCore-signed verdicts (ADR-007) → git trailers | AutoDev PR #55 + bash | WU-08 | kernel attest/verify live; trailer carries attestation_id; /verify rejects tampered | 🟡 (PR #55 draft; trailers pending) |
-| WU-10 | Server-side gem-review workflow + rulesets | github MCP + github-ops-orchestrator | WU-04 | required check on pilot repo; workflow passes its own scanner | ⬜ (needs confirm) |
+| WU-10 | Server-side gem-review workflow + rulesets | sub-agent + actionlint + zizmor | WU-04 | required check on pilot repo; workflow passes its own scanner | 🟡 (workflow done, lint-clean; repo + ruleset need Aaron) |
 | WU-11 | Warn-week telemetry → per-rule graduation | self-improving-proactive-agent | WU-08 (+7 days) | report with hits/FP per rule; graduated rules listed | ⬜ |
 | WU-12 | Skill & CLAUDE.md repair | skill-creator / propose_skills | WU-02 | no control chars; current tool names; no dangling refs | 🟢 |
 | WU-13 | Opal Gem → report-only UI | bash | WU-04 | dashboard renders only computed fields; label v5.1 | ⬜ |
@@ -133,6 +133,7 @@ workflow_unit:
 |------|------|-------|--------------|
 | 2026-11-07 | WU-01 | done: 19/19 probes confirm defects in v5 | `Kernel: GC-007 GitHubOpsGem runtime — done WU-01..02, active WU-03 (draft), runnable WU-04/05/12` |
 | 2026-11-07 | WU-02 | done: v5.1, 80 tests, probes 0/19 | ↑ |
+| 2026-11-07 | WU-05/09b/10/12 | parallel sub-agents in manual worktrees: guardrail (36 tests, fixed ThinkStreamFilter unicode-lowercase leak), Gem-Gate trailers + git notes (fixed /verify body to bare GateAttestation), hardened gem-review workflow (actionlint/zizmor clean, SHAs verified), skill repair proposed; gemcore LF-only diff split (token-hiding bug); independent review of WU-07 → 10 findings, fixer running; 290 tests | `Kernel: GC-007 — done WU-01..05, 07 (hardening in review), 08, 09a, 09b, 10 (needs repo); next: merge WU-07 hardening, re-review, WU-06 live` |
 | 2026-11-07 | WU-07 | awsbox deploy script (idempotent, DRY-first, auto-delete choice recorded, ShellCheck clean, 5 e2e tests); corrected: auto-delete is create-time only and unreadable via API; 190 tests | `Kernel: GC-007 — done WU-01..04, 07 (+deploy), 08, 09a; next: human deploy on awsbox, then WU-05` |
 | 2026-11-07 | WU-07 | lifecycle controller v1.0 (Fireworks `:scale` API, GPU-second meter, $26/day + $78/week caps, idle 180 s, SessionEnd +45 s, 429-storm wake, stray-wake undo, auto-delete/min-replica guard), LiteLLM callback verified on LiteLLM 1.108.2 Router, `gemctl heavy`, SessionEnd hook; dry-run 9/9; 181 tests | `Kernel: GC-007 — done WU-01..04, 07, 08, 09a; next WU-05, then WU-06 live (awsbox), WU-11 on 2026-11-14` |
 | 2026-11-07 | WU-04/08 | gemctl + hooks + installer, 125 tests; e2e: main push denied+signed, feature push PASS, force push WARN, all attested; AutoDev PR #56 CI fix (Kotlin green), ported to #55 | `Kernel: GC-007 — done WU-01..04, 08, 09a; next WU-07, WU-05, WU-11 (2026-11-14)` |
