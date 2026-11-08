@@ -45,10 +45,16 @@ fix/cwe94-precision:
   * CWE-94_WORKFLOW_INJECTION only in execution sinks (`run:`, actions/github-script `script:`) and only for
     attacker-controllable contexts (UntrustedContextPolicy deny/allow lists). It used to fire on any
     `${{ github.event.* }}` anywhere, e.g. a `concurrency:` group or the `env:` binding it recommends.
+  * Review of PR #2: multi-line values assembled before scanning (folded expressions), YAML escapes, aliases,
+    flow collections (parsed, also over several lines), block-scalar content indentation, quote-aware
+    `${{ }}` extraction, boolean results skipped, CodeQL-modelled code inputs of other actions, env and matrix
+    taint by worklist; patch-only ambiguity fails closed (unseen env bindings and anchors, script-like hunk
+    tops); a post-image is used only if it is the patch's target blob.
 """
 
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import hashlib
 import hmac
@@ -408,11 +414,13 @@ class UntrustedContextPolicy:
 
     _DENY = tuple(tuple(p.split(".")) for p in DENY)
     _ALLOW = tuple(tuple(p.split(".")) for p in ALLOW)
-    _CHAIN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|\*))*")
-    _STRING_INDEX_RE = re.compile(r"\[\s*'((?:[^']|'')*)'\s*\]")
-    _STRING_RE = re.compile(r"'(?:[^']|'')*'")
-    _INDEX_RE = re.compile(r"\[([^\[\]]*)\]")
+    # One pass over the expression: string literals (an unterminated one runs to the end), identifiers,
+    # numbers, two-character operators, then any single character.
+    _TOKEN_RE = re.compile(r"\s+|'(?:[^']|'')*'?|[A-Za-z_][A-Za-z0-9_-]*|[0-9][0-9A-Za-z_.]*|==|!=|<=|>=|&&|\|\||.", re.S)
     _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    _BOOLEAN_FUNCTIONS = frozenset({"contains", "startswith", "endswith", "success", "failure", "always", "cancelled"})
+    _COMPARISONS = frozenset({"==", "!=", "<", ">", "<=", ">="})
+    _MAX_BOOLEAN_TOKENS = 2000  # longer expressions are not analysed as boolean (they are scanned in full)
 
     @staticmethod
     def _compatible(chain: Tuple[str, ...], pattern: Tuple[str, ...]) -> bool:
@@ -420,37 +428,89 @@ class UntrustedContextPolicy:
         return all(c == p or "*" in (c, p) for c, p in zip(chain, pattern))
 
     @classmethod
+    def _tokens(cls, expr: str) -> List[str]:
+        return [t for t in cls._TOKEN_RE.findall(expr) if not t.isspace()]
+
+    @staticmethod
+    def _closers(toks: List[str]) -> Dict[int, int]:
+        """Index of each '(' / '[' -> index of its matching closer."""
+        match: Dict[int, int] = {}
+        stack: List[int] = []
+        for i, t in enumerate(toks):
+            if t in ("(", "["):
+                stack.append(i)
+            elif t in (")", "]") and stack:
+                match[stack.pop()] = i
+        return match
+
+    @classmethod
     def contexts(cls, expr: str) -> List[str]:
         """Context paths an expression reads, e.g. `github.event.commits.*.message` (as written; contexts
         are case-insensitive, so compare them lower-cased).
 
         `x['key']` becomes `x.key`; `x[0]` and `x[<expr>]` become `x.*` (the inner expression is read too).
-        String literals and function names are not contexts.
+        String literals and function names are not contexts. Linear in the length of the expression.
         """
-        def index_key(m: "re.Match[str]") -> str:
-            key = m.group(1).replace("''", "'")
-            return "." + key if cls._IDENT_RE.match(key) else ".*"
+        toks = cls._tokens(expr)
+        closer = cls._closers(toks)
+        found: Dict[str, str] = {}
+        for i, t in enumerate(toks):
+            if not cls._IDENT_RE.match(t) or (i and toks[i - 1] == "."):
+                continue
+            parts, j = [t], i + 1
+            while j < len(toks):
+                if toks[j] == "." and j + 1 < len(toks) and (toks[j + 1] == "*" or cls._IDENT_RE.match(toks[j + 1])):
+                    parts.append(toks[j + 1])
+                    j += 2
+                elif toks[j] == "[" and j in closer:
+                    inner = toks[j + 1:closer[j]]
+                    key = inner[0][1:-1].replace("''", "'") if (
+                        len(inner) == 1 and len(inner[0]) >= 2 and inner[0][0] == inner[0][-1] == "'") else ""
+                    parts.append(key if cls._IDENT_RE.match(key) else "*")
+                    j = closer[j] + 1
+                else:
+                    break
+            if j < len(toks) and toks[j] == "(":
+                continue  # function call: toJSON(...), format(...)
+            ctx = ".".join(parts)
+            found.setdefault(ctx.lower(), ctx)
+        return list(found.values())
 
-        text = cls._STRING_RE.sub("''", cls._STRING_INDEX_RE.sub(index_key, expr))
-        inner: List[str] = []
+    @classmethod
+    def is_boolean(cls, expr: str) -> bool:
+        """True when the expression always yields true or false (a comparison, `!x`, contains() and the other
+        boolean functions), so its expansion cannot carry attacker text. `a || b` and `a && b` yield one of
+        their operands, so they are boolean only when every operand is."""
+        toks = cls._tokens(expr)
+        return len(toks) <= cls._MAX_BOOLEAN_TOKENS and cls._boolean_tokens(toks)
 
-        def index_any(m: "re.Match[str]") -> str:
-            inner.append(m.group(1))
-            return ".*"
-
-        while True:
-            reduced = cls._INDEX_RE.sub(index_any, text)
-            if reduced == text:
-                break
-            text = reduced
-        found: List[str] = []
-        for src in (text, *inner):
-            for m in cls._CHAIN_RE.finditer(src):
-                if src[m.end():].lstrip().startswith("("):
-                    continue  # function call: toJSON(...), format(...)
-                if m.group(0).lower() not in (f.lower() for f in found):
-                    found.append(m.group(0))
-        return found
+    @classmethod
+    def _boolean_tokens(cls, toks: List[str]) -> bool:
+        closer = cls._closers(toks)
+        while toks and toks[0] == "(" and closer.get(0) == len(toks) - 1:
+            toks = toks[1:-1]
+            closer = cls._closers(toks)
+        if not toks:
+            return False
+        depth, top = 0, []  # (index, token) at nesting depth 0
+        for i, t in enumerate(toks):
+            if t in ("(", "["):
+                depth += 1
+            elif t in (")", "]"):
+                depth -= 1
+            elif depth == 0:
+                top.append((i, t))
+        for op in ("||", "&&"):
+            cuts = [i for i, t in top if t == op]
+            if cuts:
+                bounds = [-1, *cuts, len(toks)]
+                return all(cls._boolean_tokens(toks[a + 1:b]) for a, b in zip(bounds, bounds[1:]))
+        if toks[0] == "!" or any(t in cls._COMPARISONS for _, t in top):
+            return True
+        if len(toks) >= 3 and toks[0].lower() in cls._BOOLEAN_FUNCTIONS and toks[1] == "(" \
+                and closer.get(1) == len(toks) - 1:
+            return True
+        return len(toks) == 1 and toks[0].lower() in ("true", "false")
 
     @classmethod
     def classify(cls, context: str) -> str:
@@ -463,19 +523,42 @@ class UntrustedContextPolicy:
         return "unlisted"
 
     @classmethod
-    def unsafe_contexts(cls, expr: str, tainted_env: Iterable[str] = ()) -> List[str]:
-        """The unsafe contexts in one expression. `env.NAME` is unsafe when NAME is in tainted_env."""
-        tainted = {n.lower() for n in tainted_env}
+    def unsafe_contexts(cls, expr: str, taint: Optional["_Taint"] = None) -> List[str]:
+        """The unsafe contexts one expression reads, as text for a finding.
+
+        `env.NAME` and `matrix.NAME` are unsafe when `taint` says the variable is bound to an unsafe value.
+        When `taint.env_closed` (only part of the file is in view), an `env.NAME` with no binding in view is
+        unsafe too: the binding may carry untrusted data.
+        """
+        t = taint if taint is not None else _Taint()
         out: List[str] = []
         for ctx in cls.contexts(expr):
             seg = ctx.lower().split(".")
+            name = seg[1] if len(seg) > 1 and seg[1] != "*" else ""
             if seg[0] == "env":
-                hit = bool(tainted) if len(seg) == 1 or seg[1] == "*" else seg[1] in tainted
+                if not name:
+                    hit, note = bool(t.env) or t.env_closed, ""
+                elif name in t.env:
+                    hit, note = True, ""
+                else:
+                    hit = t.env_closed and name not in t.env_bound
+                    note = " (bound outside this diff)"
+            elif seg[0] == "matrix":
+                hit, note = ("*" in t.matrix or (name in t.matrix if name else bool(t.matrix))), ""
             else:
-                hit = cls.classify(ctx) == "unsafe"
+                hit, note = cls.classify(ctx) == "unsafe", ""
             if hit:
-                out.append(ctx)
+                out.append(ctx + note)
         return out
+
+
+@dataclass
+class _Taint:
+    """What the file in view says about env and matrix variables (names lower-cased)."""
+    env: Set[str] = field(default_factory=set)        # env variables bound to an unsafe value
+    env_bound: Set[str] = field(default_factory=set)  # env variables bound anywhere in view
+    env_closed: bool = False                          # only part of the file is in view: unseen binding = unsafe
+    matrix: Set[str] = field(default_factory=set)     # matrix variables bound to an unsafe value; "*" = all
 
 
 @dataclass
@@ -486,20 +569,119 @@ class _YamlFrame:
     name: str = ""                          # unquoted key as written (env variable names)
     step: Optional[Dict[str, str]] = None   # sequence items: what this file shows of the item ("uses")
     has_value: bool = False                 # key with an inline value (scalar, block or flow): no child keys
+    anchor: Optional[str] = None            # `key: &a` with the value on the next line
 
 
 @dataclass
 class _Sink:
-    kind: str                               # "run" | "script" | "unknown"
-    step: Optional[Dict[str, str]] = None   # for "script": the step whose `uses:` must be github-script
+    kind: str                               # "run" | "input" | "unknown"
+    step: Optional[Dict[str, str]] = None   # "input": the step whose `uses:` decides whether the input runs code
+    key: str = ""                           # "input": the input's name
+
+
+@dataclass
+class _Value:
+    """One YAML value as far as the diff shows it, one piece per source line, and what it is bound to."""
+    sink: Optional[_Sink] = None
+    env_name: Optional[str] = None          # the value of env.NAME
+    matrix_name: Optional[str] = None       # the value of matrix.NAME ("*": the whole matrix)
+    anchor: Optional[str] = None
+    alias: Optional[str] = None             # the value is `*alias`
+    style: str = "plain"                    # plain | single | double | block | flow | unknown
+    flow_role: str = ""                     # flow collections: step | steps | with | env | matrix | matrix-list | matrix-item
+    step: Optional[Dict[str, str]] = None   # flow "step" / "with": the step it belongs to
+    pieces: List[Tuple[int, bool, str]] = field(default_factory=list)  # (line, added, text)
 
 
 @dataclass
 class _ValueCont:
-    col: int                                # lines indented deeper than this continue the value
-    sink: Optional[_Sink]
-    env_name: Optional[str]
-    raw: bool                               # block/quoted/unknown text: a '#' there is not a YAML comment
+    value: _Value
+    col: int                                # only lines indented deeper than this can continue the value
+    content_col: Optional[int] = None       # block scalars: indentation of the content
+    quote: str = ""                         # quoted scalars: the quote still open
+    depth: int = 0                          # flow collections: brackets still open
+    done: bool = False                      # closed (quote or brackets) or ended by a comment
+
+
+class _FlowParser:
+    """Just enough of YAML flow syntax ({k: v}, [a, b], quoted and plain scalars, comments) to find keys and
+    the spans of their values. Never raises; malformed text yields a partial tree."""
+
+    MAX_DEPTH = 64
+
+    def __init__(self, text: str) -> None:
+        self.t, self.i = text, 0
+
+    def _ws(self) -> None:
+        t = self.t
+        while self.i < len(t):
+            c = t[self.i]
+            if c in " \t\r\n":
+                self.i += 1
+            elif c == "#" and (self.i == 0 or t[self.i - 1] in " \t\r\n"):
+                nl = t.find("\n", self.i)
+                self.i = len(t) if nl < 0 else nl
+            else:
+                break
+
+    def node(self, depth: int = 0) -> Tuple[Any, ...]:
+        self._ws()
+        if self.i >= len(self.t) or depth > self.MAX_DEPTH:
+            return ("scalar", self.i, self.i)
+        c = self.t[self.i]
+        if c in "{[":
+            return self._collection(depth, c)
+        return self._scalar()
+
+    def _collection(self, depth: int, opener: str) -> Tuple[Any, ...]:
+        close, entries, start = "}" if opener == "{" else "]", [], self.i
+        self.i += 1
+        while True:
+            self._ws()
+            if self.i >= len(self.t):
+                break
+            c = self.t[self.i]
+            if c == close:
+                self.i += 1
+                break
+            if c in ",}]":
+                self.i += 1
+                continue
+            before = self.i
+            if opener == "[":
+                entries.append(self.node(depth + 1))
+            else:
+                key = self._scalar()
+                self._ws()
+                value: Tuple[Any, ...] = ("scalar", self.i, self.i)
+                if self.i < len(self.t) and self.t[self.i] == ":":
+                    self.i += 1
+                    value = self.node(depth + 1)
+                entries.append((WorkflowInjectionScanner._unquote(self.t[key[1]:key[2]]), value))
+            if self.i == before:
+                self.i += 1  # always make progress
+        return ("map" if opener == "{" else "seq", entries, start, self.i)
+
+    def _scalar(self) -> Tuple[Any, ...]:
+        t, s = self.t, self.i
+        if s < len(t) and t[s] in "\"'":
+            end = WorkflowInjectionScanner._quote_close(t, t[s], s + 1)
+            self.i = len(t) if end < 0 else end + 1
+            return ("scalar", s, self.i)
+        i = s
+        while i < len(t):
+            c = t[i]
+            if t.startswith("${{", i):  # flow indicators inside an expression belong to it
+                j = t.find("}}", i + 3)
+                i = len(t) if j < 0 else j + 2
+                continue
+            if c in ",[]{}" or (c == ":" and (i + 1 == len(t) or t[i + 1] in " \t\r\n,[]{}")):
+                break
+            if c == "#" and i > s and t[i - 1] in " \t\r\n":
+                break
+            i += 1
+        self.i = i
+        return ("scalar", s, i)
 
 
 class WorkflowInjectionScanner:
@@ -507,71 +689,137 @@ class WorkflowInjectionScanner:
 
     Only execution sinks are checked, i.e. the places where GitHub substitutes `${{ }}` text into code that
     is then executed:
-      * the value of a step's `run:` (workflows and composite actions), and
-      * the `script:` input of actions/github-script (any version or ref).
+      * the value of a step's `run:` (workflows and composite actions),
+      * the `script:` input of actions/github-script (any version or ref), and the other action inputs that
+        CodeQL's actions models (and zizmor) list as code-injection sinks (ACTION_CODE_INPUTS).
     `env:` values, other `with:` inputs, job-level `with:`, `if:`, `concurrency`, `name:`, `runs-on`,
     `timeout-minutes`, outputs, `uses:` and YAML comments pass values as data and are never reported.
-    Inside a sink, a line is reported when it expands a context UntrustedContextPolicy calls unsafe, or
-    `env.NAME` where NAME is bound in this file to an unsafe value (`${{ env.NAME }}` is still a template
-    expansion; zizmor's remediation says to use the shell's "$NAME").
+    Inside a sink, an expression is reported when it can yield attacker text: it reads a context that
+    UntrustedContextPolicy calls unsafe, or `env.NAME` / `matrix.NAME` bound in view to such a value, and
+    its result is not merely true/false. `${{ env.NAME }}` is still a template expansion; zizmor's
+    remediation says to use the shell's "$NAME".
 
-    Structure comes from indentation, line by line, as for the other diff rules: block-mapping keys (plain
-    or quoted), sequence items, and multi-line values (block scalars `|`/`>-`, multi-line plain or quoted
-    scalars) that continue while lines are indented deeper than their key. The walk covers the patch's
-    context and added lines, one hunk at a time; when the caller has the post-image file and it matches every
-    context and added line of the patch, the whole file is walked instead, so the enclosing key of every
-    added line is known. Only added lines are reported.
+    Structure comes from indentation, line by line: block-mapping keys (plain or quoted, YAML escapes
+    decoded), sequence items, flow collections (also over several lines), anchors and scalar aliases,
+    and multi-line values (block scalars with their content indentation, multi-line plain or quoted
+    scalars). Each multi-line value is assembled before its `${{ }}` expressions are extracted, so an
+    expression folded over several lines is still one expression; a finding goes to the first added line
+    the expression touches. The walk covers the patch's context and added lines, one hunk at a time;
+    when the caller passes the post-image file, it is used for the whole-file walk only if it is the
+    patch's target (the `index` line's blob id, when present) and matches every context and added line.
 
-    When a hunk starts inside a multi-line value whose key lies outside the hunk, the scanner cannot see
-    whether it is a `run:` script. It fails closed: such lines are treated as a `run:` script (most
-    multi-line values in workflows are). A key-looking line at the top of a hunk is taken as a mapping key.
+    Where only part of the file is in view, ambiguity fails closed: a hunk that starts inside a
+    multi-line value is treated as a `run:` script when its top lines are not valid YAML structure (e.g.
+    JavaScript object literals in a github-script); `env.NAME` with no binding in view is unsafe; an
+    alias whose anchor is not in view is reported. A dynamic matrix whose definition is not in view is
+    treated as static.
     """
 
     KEY_RE = re.compile(r"""(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_$][A-Za-z0-9_.$/-]*)[ \t]*:(?=[ \t]|$)""")
     BLOCK_HEADER_RE = re.compile(r"^[|>][0-9+-]*$")
-    PROPERTIES_RE = re.compile(r"^(?:[&!]\S*(?:\s+|$))+")  # anchors (&a) and tags (!!str) before a value
-    EXPRESSION_RE = re.compile(r"\$\{\{(?P<expr>.*?)(?:\}\}|$)")  # an unterminated ${{ runs to end of line
-    FLOW_SINK_RE = re.compile(r"""[{,]\s*["']?(?P<key>run|script)["']?\s*:""", re.I)
-    FLOW_USES_RE = re.compile(r"""[{,]\s*["']?uses["']?\s*:\s*["']?(?P<target>[^\s"',}]+)""", re.I)
-    GITHUB_SCRIPT_RE = re.compile(r"^actions/github-script@", re.I)
-    SINK_WORDS = {
-        "run": "a `run:` script",
-        "script": "an actions/github-script `script:`",
-        "unknown": "a multi-line value whose key is outside this diff hunk (treated as a `run:` script)",
+    PROPERTY_RE = re.compile(r"([&!])(\S*)\s*")
+    ALIAS_RE = re.compile(r"\*([^\s,\[\]{}]+)")
+    INDEX_RE = re.compile(r"^index ([0-9a-f]{4,64})\.\.([0-9a-f]{4,64})\b", re.M)
+    ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)", re.S)
+    ESCAPES = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r",
+               "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0", "L": " ",
+               "P": " "}
+    # Action inputs whose value the action executes. From CodeQL's actions models (code-injection sinks, as
+    # packaged by zizmor in crates/zizmor/data/codeql-injection-sinks.json) plus the four zizmor adds in
+    # crates/zizmor/src/audit/template_injection.rs. Keys and inputs lower-cased; any ref matches.
+    ACTION_CODE_INPUTS: Dict[str, Tuple[str, ...]] = {
+        "actions/github-script": ("script",),
+        "appleboy/ssh-action": ("script",),
+        "8398a7/action-slack": ("custom_payload",),
+        "azure/cli": ("inlinescript",),
+        "azure/powershell": ("inlinescript",),
+        "devorbitus/yq-action-output": ("cmd",),
+        "gautamkrishnar/blog-post-workflow": ("item_exec",),
+        "imjohnbo/issue-bot": ("body", "linked-comments-previous-issue-text", "linked-comments-new-issue-text"),
+        "lucasbento/auto-close-issues": ("issue-close-message",),
+        "mikefarah/yq": ("cmd",),
+        "roots/issue-closer-action": ("issue-close-message", "pr-close-message"),
+        "sergeysova/jq-action": ("cmd",),
+        "skitionek/notify-microsoft-teams": ("overwrite",),
+        "tibdex/backport": ("body_template", "head_template", "labels_template", "title_template"),
+        "amadevus/pwsh-script": ("script",),
+        "jannekem/run-python-script-action": ("script",),
+        "cardinalby/js-eval-action": ("expression",),
+        "addnab/docker-run-action": ("options", "run"),
     }
-    FIX_WORDS = {
-        "run": 'map it in the step\'s `env:` (e.g. `TITLE: ${{ github.event.issue.title }}`) and use "$TITLE"',
-        "script": "map it in the step's `env:` and read `process.env.NAME` in the script",
-    }
+    FIX_RUN = 'map it in the step\'s `env:` (e.g. `TITLE: ${{ github.event.issue.title }}`) and use "$TITLE"'
+    FIX_JS = "map it in the step's `env:` and read `process.env.NAME` in the script"
+
+    # ---- entry point
 
     @classmethod
     def findings(cls, file_path: str, patch_text: str, post_image: Optional[str] = None) -> List[InlineFinding]:
-        cands: List[Tuple[int, bool, str, _Sink]] = []
-        env_values: List[Tuple[str, str]] = []
-        for segment in cls._segments(patch_text, post_image):
-            cls._walk(segment, cands, env_values)
-        tainted = cls._tainted_env(env_values)
-        out: List[InlineFinding] = []
-        reported: Set[int] = set()
-        for line, added, text, sink in cands:
-            kind = cls._resolve(sink)
-            if not added or line in reported or kind is None:
+        segments, whole_file = cls._segments(patch_text, post_image)
+        values: List[_Value] = []
+        for lines, hunk_top in segments:
+            cls._walk(lines, values, hunk_top)
+        values = cls._expand_flows(values)
+        texts = cls._resolve_aliases(values)
+        taint = cls._solve_taint(values, texts, closed=not whole_file)
+        per_line: Dict[int, Tuple[List[str], str]] = {}
+        for v, (text, offsets) in zip(values, texts):
+            where = cls._resolve(v.sink) if v.sink is not None else None
+            if where is None:
                 continue
-            bad: List[str] = []
-            for m in cls.EXPRESSION_RE.finditer(text):
-                bad += [c for c in UntrustedContextPolicy.unsafe_contexts(m.group("expr"), tainted) if c not in bad]
-            if bad:
-                reported.add(line)
-                out.append(InlineFinding(
-                    file_path, max(1, line), Severity.CRITICAL, "CWE-94_WORKFLOW_INJECTION",
-                    f"Untrusted context {', '.join(f'`{c}`' for c in bad)} is expanded by `${{{{ }}}}` inside "
-                    f"{cls.SINK_WORDS[kind]}; GitHub pastes the text into the code before it runs. Instead, "
-                    f"{cls.FIX_WORDS.get(kind, cls.FIX_WORDS['run'])}."))
-        return out
+            if v.alias is not None and text is None:  # alias to an anchor that is not in view
+                ln, added, _ = v.pieces[0]
+                if added and not whole_file:
+                    per_line.setdefault(ln, ([], where))[0].append(f"*{v.alias} (anchor outside this diff)")
+                continue
+            for start, end, inner in cls._expressions(text or ""):
+                if UntrustedContextPolicy.is_boolean(inner):
+                    continue
+                bad = UntrustedContextPolicy.unsafe_contexts(inner, taint)
+                line = cls._first_added(v.pieces, offsets, start, end) if bad else None
+                if line is not None:
+                    found = per_line.setdefault(line, ([], where))[0]
+                    found.extend(c for c in bad if c not in found)
+        return [InlineFinding(file_path, max(1, line), Severity.CRITICAL, "CWE-94_WORKFLOW_INJECTION",
+                              cls._message(bad, where)) for line, (bad, where) in sorted(per_line.items())]
 
-    @staticmethod
-    def _segments(patch_text: str, post_image: Optional[str]) -> List[List[Tuple[int, str, bool]]]:
-        """(new line number, text, added) runs: one per hunk, or the whole post-image if it matches."""
+    @classmethod
+    def _message(cls, bad: List[str], where: str) -> str:
+        if where == "run":
+            sink, fix = "a `run:` script", cls.FIX_RUN
+        elif where == "unknown":
+            sink, fix = "a multi-line value whose key is outside this diff hunk (treated as a `run:` script)", cls.FIX_RUN
+        elif where == "input:actions/github-script":
+            sink, fix = "an actions/github-script `script:`", cls.FIX_JS
+        elif where == "input:":
+            sink, fix = "a `script:` input whose action is outside this diff (treated as actions/github-script)", cls.FIX_JS
+        else:
+            action = where.split(":", 1)[1]
+            sink = f"an input that {action} runs as code"
+            fix = ("map it in the step's `env:`, forward it with `envs:` and use \"$NAME\" in the script"
+                   if action == "appleboy/ssh-action" else
+                   f"map it in the step's `env:` and read the variable inside {action}'s code instead")
+        return (f"Untrusted context {', '.join(f'`{c}`' for c in bad)} is expanded by `${{{{ }}}}` inside {sink}; "
+                f"GitHub pastes the text into the code before it runs. Instead, {fix}.")
+
+    # ---- which lines are in view
+
+    @classmethod
+    def _post_image_is_target(cls, patch_text: str, post_image: str) -> bool:
+        """When the patch names its target blob (`index <old>..<new>`), the post-image must hash to it."""
+        header = patch_text.split("\n@@", 1)[0] if not patch_text.startswith("@@") else ""
+        m = cls.INDEX_RE.search(header)
+        if m is None:
+            return True
+        data = post_image.encode("utf-8")
+        blob = b"blob %d\0" % len(data) + data
+        want = m.group(2)
+        return hashlib.sha1(blob).hexdigest().startswith(want) or hashlib.sha256(blob).hexdigest().startswith(want)
+
+    @classmethod
+    def _segments(cls, patch_text: str, post_image: Optional[str]
+                  ) -> Tuple[List[Tuple[List[Tuple[int, str, bool]], bool]], bool]:
+        """([(lines, hunk_top)], whole_file). lines are (new line number, text, added); hunk_top marks a
+        hunk that starts inside the file, so its first lines may belong to a value whose key is not in view."""
         hunks: List[List[Tuple[int, str, bool]]] = []
         prev: Optional[int] = None
         for pl in iter_patch_lines(patch_text):
@@ -581,36 +829,32 @@ class WorkflowInjectionScanner:
                 hunks.append([])
             hunks[-1].append((pl.new_line, pl.content, pl.kind == "add"))
             prev = pl.new_line
-        if post_image is not None and hunks:
+        if post_image is not None and hunks and cls._post_image_is_target(patch_text, post_image):
             lines = [ln[:-1] if ln.endswith("\r") else ln for ln in post_image.split("\n")]
             if all(0 < n <= len(lines) and lines[n - 1] == text for hunk in hunks for n, text, _ in hunk):
                 added = {n for hunk in hunks for n, _, is_add in hunk if is_add}
-                return [[(n, text, n in added) for n, text in enumerate(lines, 1)]]
-        return hunks
+                return [([(n, text, n in added) for n, text in enumerate(lines, 1)], False)], True
+        headers = [m for m in (HUNK_HEADER_RE.match(ln) for ln in patch_text.split("\n")) if m]
+        new_file = len(headers) == 1 and headers[0].group(1) == "0" and headers[0].group(2) == "0"
+        return [(hunk, hunk[0][0] > 1) for hunk in hunks], new_file
+
+    # ---- the line walk
 
     @classmethod
-    def _walk(cls, lines: List[Tuple[int, str, bool]], cands: List[Tuple[int, bool, str, _Sink]],
-              env_values: List[Tuple[str, str]]) -> None:
+    def _walk(cls, lines: List[Tuple[int, str, bool]], values: List[_Value], hunk_top: bool) -> None:
         stack: List[_YamlFrame] = []
         cont: Optional[_ValueCont] = None
-
-        def emit(ln: int, added: bool, text: str, sink: Optional[_Sink], env_name: Optional[str]) -> None:
-            if sink is not None:
-                cands.append((ln, added, text, sink))
-            if env_name is not None:
-                env_values.append((env_name, text))
-
-        for ln, raw, added in lines:
+        script_until, script, judged_until = -1, _Value(), -1
+        for idx, (ln, raw, added) in enumerate(lines):
             body = raw.rstrip()
             stripped = body.strip()
             indent = len(body) - len(body.lstrip(" "))
+            if idx < script_until:  # inside a hunk-top region judged to be script text
+                if stripped:
+                    script.pieces.append((ln, added, body))
+                continue
             if cont is not None:
-                if not stripped:
-                    continue
-                # Still inside the multi-line value, unless a plain scalar meets a `key:` line: plain scalars
-                # cannot contain ": ", so that line is structure (seen in hand-written or partial diffs).
-                if indent > cont.col and (cont.raw or not cls._has_key(body)):
-                    emit(ln, added, body if cont.raw else cls._strip_comment(body), cont.sink, cont.env_name)
+                if cls._continues(cont, body, stripped, indent, ln, added):
                     continue
                 cont = None
             if not stripped or stripped.startswith("#"):
@@ -618,6 +862,13 @@ class WorkflowInjectionScanner:
             if stripped in ("---", "...") or (indent == 0 and stripped.startswith("%")):
                 stack.clear()
                 continue
+            if hunk_top and idx >= judged_until and not any(f.col < indent for f in stack):
+                judged_until, is_script = cls._script_region(lines, idx)
+                if is_script:
+                    script_until, script = judged_until, _Value(sink=_Sink("unknown"), style="unknown")
+                    script.pieces.append((ln, added, body))
+                    values.append(script)
+                    continue
             col, rest, item = indent, body[indent:], None
             while rest[:1] == "-" and rest[1:2] in ("", " ", "\t"):  # one or more sequence items
                 while stack and (stack[-1].col > col or stack[-1].has_value
@@ -635,45 +886,186 @@ class WorkflowInjectionScanner:
                 while stack and (stack[-1].col >= col or stack[-1].has_value):
                     stack.pop()
                 parent = stack[-1] if stack else None
-                value, style = cls._split_value(rest[m.end():])
-                stack.append(_YamlFrame(col, "key", name.lower(), name, has_value=style != "empty"))
-                sink = cls._sink_for(stack)
-                env_name = name if parent is not None and parent.kind == "key" and parent.key == "env" else None
-                if parent is not None and parent.kind == "item" and stack[-1].key == "uses" and parent.step is not None:
-                    parent.step["uses"] = cls._unquote(value)
-                if style == "flow" and stack[-1].key == "with" and value.startswith("{"):
-                    owner = cls._with_owner(stack)
-                    if owner is not False:
-                        cls._flow_sinks(value, ln, added, cands, owner, allow_run=False)
-                if style == "block":
-                    cont = _ValueCont(col, sink, env_name, raw=True)
-                elif style != "empty":
-                    emit(ln, added, value, sink, env_name)
-                    cont = _ValueCont(col, sink, env_name, raw=style != "plain")
+                head = cls._split_value(rest[m.end():])
+                stack.append(_YamlFrame(col, "key", name.lower(), name, has_value=head["style"] != "empty"))
+                if head["style"] == "empty":
+                    stack[-1].anchor = head["anchor"]
+                    continue
+                if name.lower() == "uses" and parent is not None and parent.step is not None and head["text"]:
+                    parent.step["uses"] = cls._unquote(head["text"])
+                cont = cls._start(cls._value_for(stack, head), col, ln, added, head, values)
                 continue
-            if item is not None:  # a scalar sequence entry: data, unless it is a flow-mapping step
-                value, style = cls._split_value(rest)
-                if style == "flow" and value.startswith("{") and cls._is_step(stack, len(stack) - 1):
-                    cls._flow_sinks(value, ln, added, cands, item.step, allow_run=True)
-                cont = _ValueCont(item.col, None, None, raw=True)
+            if item is not None:  # a scalar sequence entry (or a flow-mapping step)
+                head = cls._split_value(rest)
+                cont = cls._start(cls._value_for(stack, head), item.col, ln, added, head, values)
                 continue
             # A scalar on a line of its own: the value of the key above it, or the middle of a multi-line value.
             while stack and stack[-1].col >= indent:
                 stack.pop()
-            owner_frame = stack[-1] if stack else None
-            if owner_frame is None:  # the value's key is outside this hunk: fail closed
-                sink = _Sink("unknown")
-                emit(ln, added, body, sink, None)
-                cont = _ValueCont(indent - 1, sink, None, raw=True)
-            elif owner_frame.kind == "key":
+            owner = stack[-1] if stack else None
+            if owner is None:  # the value's key is outside this hunk: fail closed
+                v = _Value(sink=_Sink("unknown"), style="unknown", pieces=[(ln, added, body)])
+                values.append(v)
+                cont = _ValueCont(v, indent - 1)
+            elif owner.kind == "key":
+                head = cls._split_value(rest)
+                head["anchor"] = head["anchor"] or owner.anchor
+                owner.has_value = True
                 parent = stack[-2] if len(stack) > 1 else None
-                env_name = owner_frame.name if parent is not None and parent.kind == "key" and parent.key == "env" else None
-                value, style = cls._split_value(rest)
-                sink = cls._sink_for(stack)
-                emit(ln, added, value, sink, env_name)
-                cont = _ValueCont(owner_frame.col, sink, env_name, raw=style != "plain")
+                if owner.key == "uses" and parent is not None and parent.step is not None and head["text"]:
+                    parent.step["uses"] = cls._unquote(head["text"])
+                cont = cls._start(cls._value_for(stack, head), owner.col, ln, added, head, values)
             else:
-                cont = _ValueCont(owner_frame.col, None, None, raw=True)
+                cont = _ValueCont(_Value(style="unknown"), owner.col)
+
+    @classmethod
+    def _continues(cls, cont: _ValueCont, body: str, stripped: str, indent: int, ln: int, added: bool) -> bool:
+        """Add the line to the open multi-line value if it belongs to it."""
+        v = cont.value
+        if v.style == "block":
+            if not stripped:
+                return True
+            if cont.content_col is None:
+                if indent <= cont.col:
+                    return False
+                cont.content_col = indent
+            if indent < cont.content_col:
+                return False  # a less-indented comment or key: the block scalar has ended
+            v.pieces.append((ln, added, body))
+            return True
+        if cont.done or not stripped or indent <= cont.col:
+            return bool(not stripped and not cont.done)
+        if v.style in ("single", "double"):
+            end = cls._quote_close(body, cont.quote, indent)
+            v.pieces.append((ln, added, body if end < 0 else body[:end + 1]))
+            cont.done = end >= 0
+            return True
+        if v.style == "flow":
+            text = cls._strip_comment(body, quotes=True)
+            v.pieces.append((ln, added, text))
+            cont.depth = cls._flow_depth(text, cont.depth)
+            cont.done = cont.depth <= 0
+            return True
+        if v.style == "plain":
+            if cls._has_key(body):
+                return False  # plain scalars cannot contain ": ", so this is structure
+            text = cls._strip_comment(body)
+            v.pieces.append((ln, added, text))
+            cont.done = text != body  # a comment ends a plain scalar
+            return True
+        v.pieces.append((ln, added, body))  # unknown: raw text
+        return True
+
+    @classmethod
+    def _start(cls, v: _Value, col: int, ln: int, added: bool, head: Dict[str, Any],
+               values: List[_Value]) -> Optional[_ValueCont]:
+        """Record a value that starts on this line; return its continuation state if it can go on."""
+        values.append(v)
+        style = head["style"]
+        if style == "block":
+            return _ValueCont(v, col, content_col=col + head["indent"] if head["indent"] else None)
+        v.pieces.append((ln, added, head["text"]))
+        if style == "alias":
+            v.alias = head["alias"]
+            return None
+        if style in ("single", "double") and head["open"]:
+            return _ValueCont(v, col, quote=head["text"][0])
+        if style == "flow" and head["depth"] > 0:
+            return _ValueCont(v, col, depth=head["depth"])
+        if style == "plain" and head["open"]:
+            return _ValueCont(v, col)
+        return None
+
+    @classmethod
+    def _value_for(cls, stack: List[_YamlFrame], head: Dict[str, Any]) -> _Value:
+        """A value for the node on top of the stack (a key, or a sequence item holding a scalar)."""
+        top = stack[-1]
+        parent = stack[-2] if len(stack) > 1 else None
+        style = "plain" if head["style"] in ("empty", "alias") else head["style"]
+        v = _Value(style=style, anchor=head["anchor"], matrix_name=cls._matrix_name(stack))
+        flow_map = head["style"] == "flow" and head["text"].startswith("{")
+        if top.kind == "key":
+            v.sink = cls._sink_for(stack)
+            if parent is not None and parent.kind == "key" and parent.key == "env":
+                v.env_name = top.name
+            if head["style"] == "flow":
+                if top.key == "with" and flow_map:
+                    owner = cls._with_owner(stack)
+                    if owner is not False:
+                        v.flow_role, v.step = "with", owner
+                elif top.key == "env" and flow_map:
+                    v.flow_role = "env"
+                elif top.key == "steps":
+                    v.flow_role = "steps"
+                elif v.matrix_name == "*" and top.key == "matrix" and flow_map:
+                    v.flow_role, v.matrix_name = "matrix", None
+                elif v.matrix_name == "*" and top.key in ("include", "exclude"):
+                    v.flow_role, v.matrix_name = "matrix-list", None
+        elif flow_map:
+            if parent is not None and parent.kind == "key" and parent.key in ("include", "exclude") \
+                    and cls._matrix_name(stack[:-1]) == "*":
+                v.flow_role, v.matrix_name = "matrix-item", None
+            elif cls._is_step(stack, len(stack) - 1):
+                v.flow_role, v.step = "step", top.step
+        return v
+
+    @classmethod
+    def _script_region(cls, lines: List[Tuple[int, str, bool]], start: int) -> Tuple[int, bool]:
+        """At a line no visible key owns, look at the lines from there until the text dedents: (end of that
+        region, True) if the lines at its indentation are not valid YAML structure, so the region is the inside
+        of a block scalar (a script); (end, False) if they are structure."""
+        first = lines[start][1].rstrip()
+        base = len(first) - len(first.lstrip(" "))
+        if base == 0:
+            return len(lines), False
+        end, script = start, False
+        for j in range(start, len(lines)):
+            body = lines[j][1].rstrip()
+            stripped = body.strip()
+            indent = len(body) - len(body.lstrip(" "))
+            if stripped and indent < base:
+                break
+            end = j + 1
+            if not stripped or indent != base or stripped.startswith("#") or script:
+                continue
+            rest, item = stripped, False
+            while rest[:1] == "-" and rest[1:2] in ("", " ", "\t"):
+                rest, item = rest[1:].lstrip(" \t"), True
+            m = cls.KEY_RE.match(rest)
+            if m is None:  # a scalar line among keys is text; a sequence entry is structure if it parses
+                script = not item or cls._not_yaml_value(rest)
+            else:
+                script = cls._not_yaml_value(rest[m.end():])
+        return end, script
+
+    @classmethod
+    def _not_yaml_value(cls, text: str) -> bool:
+        """`key: 'x',`, `key: value;` or `- [text](link)` reads as code or prose, not as a YAML value: a
+        quoted scalar or flow collection with text after its end, or a plain value ending in , ; or (."""
+        v = text.strip()
+        end = -1
+        if v[:1] in ("'", '"'):
+            end = cls._quote_close(v, v[0], 1)
+        elif v[:1] in ("[", "{"):
+            depth, quote = 0, ""
+            for i, c in enumerate(v):
+                if quote:
+                    quote = "" if c == quote else quote
+                elif c in "\"'":
+                    quote = c
+                elif c in "[{":
+                    depth += 1
+                elif c in "]}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+        else:
+            return cls._strip_comment(v).endswith((",", ";", "("))
+        tail = v[end + 1:].strip() if end >= 0 else ""
+        return bool(tail) and not tail.startswith("#")
+
+    # ---- what the stack says
 
     @classmethod
     def _has_key(cls, line: str) -> bool:
@@ -705,43 +1097,305 @@ class WorkflowInjectionScanner:
         """The sink whose value the key on top of the stack holds, if any."""
         frame = stack[-1]
         parent = stack[-2] if len(stack) > 1 else None
-        if frame.key == "run":
-            if parent is None or (parent.kind == "item" and cls._is_step(stack, len(stack) - 2)):
-                return _Sink("run")
-            return None  # defaults.run, a job named "run", a `run` input in `with:` ...
-        if frame.key == "script":
-            if parent is None:
-                return _Sink("script")
-            if parent.kind == "key" and parent.key == "with":
-                owner = cls._with_owner(stack[:-1])
-                if owner is not False:
-                    return _Sink("script", owner)
-        return None
+        if parent is not None and parent.kind == "key" and parent.key == "with":
+            owner = cls._with_owner(stack[:-1])
+            return None if owner is False else _Sink("input", owner, frame.key)
+        if frame.key == "run" and (parent is None or (parent.kind == "item" and cls._is_step(stack, len(stack) - 2))):
+            return _Sink("run")
+        if frame.key == "script" and parent is None:
+            return _Sink("input", None, "script")
+        return None  # defaults.run, a job named "run", any other key
+
+    @staticmethod
+    def _matrix_name(stack: List[_YamlFrame]) -> Optional[str]:
+        """The matrix variable the node on top of the stack defines ("*" for the whole matrix), if any."""
+        idx = next((i for i in range(len(stack) - 1, -1, -1) if stack[i].kind == "key" and stack[i].key == "matrix"
+                    and (i == 0 or (stack[i - 1].kind == "key" and stack[i - 1].key == "strategy"))), None)
+        if idx is None:
+            return None
+        above = [f for f in stack[idx + 1:] if f.kind == "key"]
+        if above and above[0].key in ("include", "exclude"):
+            above = above[1:]
+        return above[0].name.lower() if above else "*"
 
     @classmethod
     def _resolve(cls, sink: _Sink) -> Optional[str]:
-        if sink.kind == "script":
-            uses = (sink.step or {}).get("uses")
-            if uses is not None and not cls.GITHUB_SCRIPT_RE.match(uses):
-                return None  # a `script:` input of some other action is data
-        return sink.kind
+        """"run", "unknown" or "input:<action>" for a sink that executes its value; None if it is data."""
+        if sink.kind != "input":
+            return sink.kind
+        uses = (sink.step or {}).get("uses")
+        if not uses:  # the step's action is not in view: only `script:` fails closed (github-script)
+            return "input:" if sink.key == "script" else None
+        action = uses.split("@", 1)[0].lower()
+        return f"input:{action}" if sink.key.lower() in cls.ACTION_CODE_INPUTS.get(action, ()) else None
+
+    # ---- after the walk
 
     @classmethod
-    def _flow_sinks(cls, text: str, ln: int, added: bool, cands: List[Tuple[int, bool, str, _Sink]],
-                    step: Optional[Dict[str, str]], allow_run: bool) -> None:
-        """Sinks inside a one-line flow mapping: `- {run: ...}` or `with: {script: ...}`."""
-        mu = cls.FLOW_USES_RE.search(text)
-        if mu and step is not None:
-            step.setdefault("uses", mu.group("target"))
-        for mk in cls.FLOW_SINK_RE.finditer(text):
-            kind = mk.group("key").lower()
-            if kind == "script" or allow_run:
-                cands.append((ln, added, cls._flow_value(text, mk.end()), _Sink(kind, step)))
+    def _expand_flows(cls, values: List[_Value]) -> List[_Value]:
+        """Replace flow collections that hold steps, `with:`, `env:` or matrix entries by their entries."""
+        out: List[_Value] = []
+        for v in values:
+            out.append(v)
+            if v.style != "flow" or not v.flow_role:
+                continue
+            text, offsets = cls._assemble(v.pieces)
+            node = _FlowParser(text).node()
+
+            def sub(n: Tuple[Any, ...], **kw: Any) -> None:
+                """A value for the node's text; scalars only, except for matrix variables (any node)."""
+                if n[0] != "scalar" and "matrix_name" not in kw:
+                    return
+                s, e = (n[1], n[2]) if n[0] == "scalar" else (n[2], n[3])
+                style = {"'": "single", '"': "double"}.get(text[s:s + 1], "plain")
+                out.append(_Value(style=style, pieces=cls._slice(v.pieces, offsets, s, e), **kw))
+
+            def entries(n: Tuple[Any, ...]) -> List[Tuple[str, Tuple[Any, ...]]]:
+                return n[1] if n[0] == "map" else []
+
+            def items(n: Tuple[Any, ...]) -> List[Tuple[Any, ...]]:
+                return n[1] if n[0] == "seq" else []
+
+            def step(n: Tuple[Any, ...], st: Dict[str, str]) -> None:
+                for key, val in entries(n):
+                    k = key.lower()
+                    if k == "uses" and val[0] == "scalar":
+                        st["uses"] = cls._unquote(text[val[1]:val[2]])
+                    elif k == "run":
+                        sub(val, sink=_Sink("run"))
+                    elif k == "with":
+                        for ik, iv in entries(val):
+                            sub(iv, sink=_Sink("input", st, ik.lower()))
+                    elif k == "env":
+                        for ek, ev in entries(val):
+                            sub(ev, env_name=ek)
+
+            def matrix_vars(n: Tuple[Any, ...]) -> None:
+                for key, val in entries(n):
+                    sub(val, matrix_name=key.lower())
+
+            if v.flow_role == "step":
+                step(node, v.step if v.step is not None else {})
+            elif v.flow_role == "steps":
+                for it in items(node):
+                    step(it, {})
+            elif v.flow_role == "with":
+                for key, val in entries(node):
+                    sub(val, sink=_Sink("input", v.step, key.lower()))
+            elif v.flow_role == "env":
+                for key, val in entries(node):
+                    sub(val, env_name=key)
+            elif v.flow_role == "matrix":
+                for key, val in entries(node):
+                    if key.lower() in ("include", "exclude"):
+                        for it in items(val):
+                            matrix_vars(it)
+                    else:
+                        sub(val, matrix_name=key.lower())
+            elif v.flow_role == "matrix-list":
+                for it in items(node):
+                    matrix_vars(it)
+            elif v.flow_role == "matrix-item":
+                matrix_vars(node)
+        return out
+
+    @classmethod
+    def _resolve_aliases(cls, values: List[_Value]) -> List[Tuple[Optional[str], List[int]]]:
+        """(text, piece offsets) per value; an alias takes the text of the latest anchor before it (None if
+        that anchor is not in view)."""
+        anchors: Dict[str, str] = {}
+        out: List[Tuple[Optional[str], List[int]]] = []
+        for v in values:
+            if v.alias is not None:
+                text = anchors.get(v.alias)
+                out.append((text, [0]))
+            else:
+                text, offsets = cls._assemble(v.pieces, decode=v.style)
+                out.append((text, offsets))
+            if v.anchor is not None and text is not None:
+                anchors[v.anchor] = text
+        return out
+
+    @classmethod
+    def _solve_taint(cls, values: List[_Value], texts: List[Tuple[Optional[str], List[int]]],
+                     closed: bool) -> _Taint:
+        """Which env / matrix variables hold attacker text. Each binding is parsed once; taint then spreads
+        over a worklist, so a chain of n bindings costs O(n)."""
+        P = UntrustedContextPolicy
+        bindings: List[Tuple[str, str]] = []
+        for v, (text, _) in zip(values, texts):
+            for kind, name in (("env", v.env_name), ("matrix", v.matrix_name)):
+                if name is not None:
+                    bindings.append((kind, name.lower()))
+        taint = _Taint(env_closed=closed, env_bound={n for k, n in bindings if k == "env"})
+        users: Dict[Tuple[str, str], List[int]] = {}
+        queue: Deque[int] = deque()
+        b = 0
+        for v, (text, _) in zip(values, texts):
+            for kind, name in (("env", v.env_name), ("matrix", v.matrix_name)):
+                if name is None:
+                    continue
+                direct = text is None and v.alias is not None and closed  # alias to an anchor not in view
+                for _, _, inner in cls._expressions(text or ""):
+                    if P.is_boolean(inner):
+                        continue
+                    for ctx in P.contexts(inner):
+                        seg = ctx.lower().split(".")
+                        if seg[0] in ("env", "matrix"):
+                            ref = seg[1] if len(seg) > 1 else "*"
+                            if seg[0] == "env" and closed and (ref == "*" or ref not in taint.env_bound):
+                                direct = True
+                            else:
+                                users.setdefault((seg[0], ref), []).append(b)
+                        elif P.classify(ctx) == "unsafe":
+                            direct = True
+                if direct:
+                    queue.append(b)
+                b += 1
+        tainted: Set[Tuple[str, str]] = set()
+        done: Set[int] = set()
+        fired: Set[str] = set()
+        while queue:
+            i = queue.popleft()
+            if i in done:
+                continue
+            done.add(i)
+            var = bindings[i]
+            if var in tainted:
+                continue
+            tainted.add(var)
+            nxt = list(users.get(var, ()))
+            if var[0] not in fired:  # wildcard readers (toJSON(env), matrix.*) depend on any variable
+                fired.add(var[0])
+                nxt += users.get((var[0], "*"), [])
+            if var == ("matrix", "*"):  # a fully dynamic matrix taints every matrix variable
+                nxt += [j for (k, _), js in users.items() if k == "matrix" for j in js]
+            queue.extend(j for j in nxt if j not in done)
+        taint.env = {n for k, n in tainted if k == "env"}
+        taint.matrix = {n for k, n in tainted if k == "matrix"}
+        return taint
+
+    # ---- text helpers
+
+    @classmethod
+    def _assemble(cls, pieces: List[Tuple[int, bool, str]], decode: str = "") -> Tuple[str, List[int]]:
+        """The value's text, pieces joined by newlines (double-quoted escapes decoded), and piece offsets."""
+        parts = [cls._decode_double(t) if decode == "double" else t for _, _, t in pieces]
+        offsets, pos = [], 0
+        for p in parts:
+            offsets.append(pos)
+            pos += len(p) + 1
+        return "\n".join(parts), offsets
 
     @staticmethod
-    def _flow_value(text: str, start: int) -> str:
-        """The value that starts at `start` in a flow mapping: up to the next ',' or '}' at its own level."""
-        depth, quote, i = 0, "", start
+    def _slice(pieces: List[Tuple[int, bool, str]], offsets: List[int], s: int, e: int) -> List[Tuple[int, bool, str]]:
+        out = []
+        for (ln, added, text), off in zip(pieces, offsets):
+            a, b = max(s, off), min(e, off + len(text))
+            if a < b:
+                out.append((ln, added, text[a - off:b - off]))
+        return out
+
+    @staticmethod
+    def _first_added(pieces: List[Tuple[int, bool, str]], offsets: List[int], s: int, e: int) -> Optional[int]:
+        """The first added line among the pieces that the span [s, e) touches."""
+        i = max(0, bisect.bisect_right(offsets, s) - 1)
+        while i < len(pieces) and offsets[i] < max(e, s + 1):
+            if pieces[i][1]:
+                return pieces[i][0]
+            i += 1
+        return None
+
+    @staticmethod
+    def _expressions(text: str) -> List[Tuple[int, int, str]]:
+        """(start, end, inner) for each `${{ }}`. A `}}` inside a single-quoted string does not close it. An
+        unterminated expression runs to the end of its line; after one, later expressions are cut at their
+        line end too, which keeps the scan linear."""
+        out: List[Tuple[int, int, str]] = []
+        i, exhausted = 0, False
+        while True:
+            s = text.find("${{", i)
+            if s < 0:
+                return out
+            end, j, quote = -1, s + 3, False
+            while not exhausted and j < len(text):
+                c = text[j]
+                if quote:
+                    if c == "'":
+                        if text.startswith("'", j + 1):
+                            j += 2
+                            continue
+                        quote = False
+                elif c == "'":
+                    quote = True
+                elif c == "}" and text.startswith("}", j + 1):
+                    end = j
+                    break
+                j += 1
+            if end < 0:
+                exhausted = True
+                nl = text.find("\n", s)
+                stop = len(text) if nl < 0 else nl
+                out.append((s, stop, text[s + 3:stop]))
+                i = max(stop, s + 3)
+            else:
+                out.append((s, end + 2, text[s + 3:end]))
+                i = end + 2
+
+    @classmethod
+    def _split_value(cls, text: str) -> Dict[str, Any]:
+        """What the text after `key:` (or `- `) says: style empty|block|single|double|flow|plain|alias, the
+        value's text on this line (YAML comment removed), anchor, alias, explicit block indentation, whether
+        a quoted or plain scalar may go on, and the flow brackets still open."""
+        v, anchor = text.strip(), None
+        while v[:1] in ("&", "!"):
+            m = cls.PROPERTY_RE.match(v)
+            if m.group(1) == "&":
+                anchor = m.group(2)
+            v = v[m.end():]
+        head: Dict[str, Any] = {"style": "plain", "text": "", "anchor": anchor, "alias": None, "indent": None,
+                                "open": False, "depth": 0}
+        if not v or v.startswith("#"):
+            head["style"] = "empty"
+        elif v.startswith("*"):
+            m = cls.ALIAS_RE.match(v)
+            head.update(style="alias", alias=m.group(1) if m else v[1:])
+        elif cls.BLOCK_HEADER_RE.match(v.split(None, 1)[0]) and (len(v.split(None, 1)) == 1
+                                                               or v.split(None, 1)[1].startswith("#")):
+            digit = re.search(r"[1-9]", v.split(None, 1)[0])
+            head.update(style="block", indent=int(digit.group()) if digit else None)
+        elif v[0] in "\"'":
+            end = cls._quote_close(v, v[0], 1)
+            head.update(style="double" if v[0] == '"' else "single", text=v if end < 0 else v[:end + 1], open=end < 0)
+        elif v[0] in "{[":
+            t = cls._strip_comment(v, quotes=True)
+            head.update(style="flow", text=t, depth=cls._flow_depth(t, 0))
+        else:
+            t = cls._strip_comment(v)
+            head.update(text=t, open=t == v)  # a comment ends a plain scalar
+        return head
+
+    @staticmethod
+    def _quote_close(text: str, quote: str, start: int) -> int:
+        """Index of the quote that closes a scalar whose text continues at `start`, or -1."""
+        i = start
+        while i < len(text):
+            c = text[i]
+            if quote == '"' and c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                if quote == "'" and text.startswith("'", i + 1):
+                    i += 2
+                    continue
+                return i
+            i += 1
+        return -1
+
+    @staticmethod
+    def _flow_depth(text: str, depth: int) -> int:
+        """Bracket depth after this line of a flow collection (quotes and `${{ }}` respected)."""
+        quote, i = "", 0
         while i < len(text):
             c = text[i]
             if quote:
@@ -751,47 +1405,16 @@ class WorkflowInjectionScanner:
                     quote = ""
             elif c in "\"'":
                 quote = c
+            elif text.startswith("${{", i):
+                j = text.find("}}", i + 3)
+                i = len(text) if j < 0 else j + 2
+                continue
             elif c in "{[":
                 depth += 1
-            elif c in "}]" or c == ",":
-                if depth == 0:
-                    break
-                if c != ",":
-                    depth -= 1
+            elif c in "}]":
+                depth -= 1
             i += 1
-        return text[start:i]
-
-    @classmethod
-    def _split_value(cls, text: str) -> Tuple[str, str]:
-        """(value without its YAML comment, style): style is empty|block|quoted|flow|plain."""
-        v = cls.PROPERTIES_RE.sub("", text.strip(), count=1)
-        if not v or v.startswith("#"):
-            return "", "empty"
-        head = v.split(None, 1)
-        if cls.BLOCK_HEADER_RE.match(head[0]) and (len(head) == 1 or head[1].startswith("#")):
-            return "", "block"
-        if v[0] in "\"'":
-            end = cls._quote_end(v)
-            return (v if end < 0 else v[:end + 1]), "quoted"
-        if v[0] in "{[":
-            return cls._strip_comment(v, quotes=True), "flow"
-        return cls._strip_comment(v), "plain"
-
-    @staticmethod
-    def _quote_end(v: str) -> int:
-        """Index of the quote that closes the scalar opened by v[0], or -1 if it continues on later lines."""
-        q, i = v[0], 1
-        while i < len(v):
-            if q == '"' and v[i] == "\\":
-                i += 2
-                continue
-            if v[i] == q:
-                if q == "'" and v[i + 1:i + 2] == "'":
-                    i += 2
-                    continue
-                return i
-            i += 1
-        return -1
+        return depth
 
     @staticmethod
     def _strip_comment(v: str, quotes: bool = False) -> str:
@@ -811,26 +1434,27 @@ class WorkflowInjectionScanner:
             i += 1
         return v
 
-    @staticmethod
-    def _unquote(s: str) -> str:
+    @classmethod
+    def _decode_double(cls, s: str) -> str:
+        """YAML double-quoted escapes (\\x24, \\u0024, \\U00000024, \\n, ...) decoded; unknown ones kept."""
+        def one(m: "re.Match[str]") -> str:
+            e = m.group(1)
+            if e[0] in "xuU" and len(e) > 1:
+                try:
+                    return chr(int(e[1:], 16))
+                except (ValueError, OverflowError):
+                    return m.group(0)
+            return cls.ESCAPES.get(e, m.group(0))
+        return cls.ESCAPE_RE.sub(one, s)
+
+    @classmethod
+    def _unquote(cls, s: str) -> str:
         s = s.strip()
         if len(s) >= 2 and s[0] == s[-1] == '"':
-            return s[1:-1].replace('\\"', '"')
+            return cls._decode_double(s[1:-1])
         if len(s) >= 2 and s[0] == s[-1] == "'":
             return s[1:-1].replace("''", "'")
         return s
-
-    @classmethod
-    def _tainted_env(cls, env_values: List[Tuple[str, str]]) -> Set[str]:
-        """Names of env variables bound to an unsafe value anywhere in view (step env may read job env)."""
-        tainted: Set[str] = set()
-        while True:
-            grown = {name.lower() for name, text in env_values
-                     if any(UntrustedContextPolicy.unsafe_contexts(m.group("expr"), tainted)
-                            for m in cls.EXPRESSION_RE.finditer(text))}
-            if grown <= tainted:
-                return tainted
-            tainted |= grown
 
 
 # --------------------------------------------------------------------------- supply chain & secrets
@@ -887,8 +1511,9 @@ class SupplyChainAndSecretScanner:
         """Findings on the added lines of one file's unified diff.
 
         post_image: optional full text of the file after the change. It is used only to give the CWE-94
-        rule the YAML context of each added line, and only when it matches every context and added line of
-        the patch; otherwise the rule works from the patch alone.
+        rule the YAML context of each added line, and only when it is the patch's target (it hashes to the
+        blob on the patch's `index` line, if there is one) and matches every context and added line of the
+        patch; otherwise the rule works from the patch alone.
         """
         findings: List[InlineFinding] = []
         is_workflow = bool(cls.WORKFLOW_PATH_RE.search(file_path))

@@ -5,8 +5,8 @@ Every subcommand reads files or stdin and writes JSON (or text where noted) to s
 Exit codes: 0 = ok / PASS / WARN, 2 = BLOCK or verification failed, 1 = usage or input error.
 
   gemctl scan-diff  --path FILE [--patch PATCHFILE|-]         findings for one file's unified diff
-                    (for a workflow, FILE is also read from disk when it exists there, so the CWE-94
-                    rule sees the YAML around each hunk; it is ignored unless it matches the patch)
+                    (for a workflow, FILE is also read from disk when the patch's `index` line names
+                    it as the target blob, so the CWE-94 rule sees the YAML around each hunk)
   gemctl debt       --patch PATCHFILE|- [--has-tests] [--tests-passed yes|no]
                     [--prompt-versioned] [--provenance]        PSC / DUR / policy report
   gemctl gate       --tool T --branch B [--event APPROVE] [--payload FILE|-]
@@ -70,13 +70,17 @@ def _emit(obj: Any) -> None:
 POST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
 
-def _post_image(path: str) -> Optional[str]:
-    """The workflow file at `path`, if it is a regular file on disk (no symlink) of sane size, else None.
+def _post_image(path: str, patch_text: str) -> Optional[str]:
+    """The workflow file at `path`, if the patch names its target blob (an `index <old>..<new>` line, as git
+    diff writes) and the file is a regular file on disk (no symlink) of sane size; else None.
 
-    audit_diff uses it only as YAML context for the CWE-94 rule, and only when every context and added line
-    of the patch appears in it at the same line number; any other file at that path is ignored.
+    audit_diff uses it only as YAML context for the CWE-94 rule, and only when it hashes to that blob and
+    every context and added line of the patch appears in it at the same line number. A working tree that
+    differs from the patch's target (unstaged edits next to a staged patch) is therefore never used.
     """
     if not gem.SupplyChainAndSecretScanner.WORKFLOW_PATH_RE.search(path):
+        return None
+    if not gem.WorkflowInjectionScanner.INDEX_RE.search(patch_text.split("\n@@", 1)[0]):
         return None
     try:
         st = os.lstat(path)
@@ -89,7 +93,8 @@ def _post_image(path: str) -> Optional[str]:
 
 
 def cmd_scan_diff(a: argparse.Namespace) -> int:
-    findings = gem.SupplyChainAndSecretScanner.audit_diff(a.path, _read(a.patch), post_image=_post_image(a.path))
+    patch = _read(a.patch)
+    findings = gem.SupplyChainAndSecretScanner.audit_diff(a.path, patch, post_image=_post_image(a.path, patch))
     _emit({"path": a.path, "findings": findings,
            "critical": sum(f.severity == gem.Severity.CRITICAL for f in findings)})
     return 2 if a.fail_on_critical and any(f.severity == gem.Severity.CRITICAL for f in findings) else 0
