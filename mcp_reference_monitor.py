@@ -192,7 +192,9 @@ def iter_patch_lines(patch_text: str) -> Iterator[PatchLine]:
     old_no = new_no = 0
     old_left = new_left = 0
     in_hunk = False
-    for raw in patch_text.splitlines():
+    # Split on LF only: str.splitlines() also breaks on \x1c-\x1e, \x85, \u2028/9, \v, \f, which let an
+    # attacker push the rest of an added line into a fake context line the scanners skip.
+    for raw in (line[:-1] if line.endswith("\r") else line for line in patch_text.split("\n")):
         m = HUNK_HEADER_RE.match(raw)
         if m:
             old_no, new_no = int(m.group(1)), int(m.group(3))
@@ -1095,7 +1097,9 @@ class StatefulGitHubOpsMonitor:
     @classmethod
     def truncate_ci_log(cls, raw_log: str, max_total_lines: int = 220, tail_lines: int = 40) -> str:
         """Window a CI log: FIRST error window (root cause) first, then later windows, then the tail."""
-        lines = raw_log.splitlines()
+        lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw_log.split("\n")]
+        if lines and lines[-1] == "":
+            lines.pop()
         if len(lines) <= max_total_lines:
             return raw_log
         intervals: List[List[int]] = []

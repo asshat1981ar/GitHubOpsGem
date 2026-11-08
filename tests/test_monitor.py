@@ -469,3 +469,29 @@ def test_wrong_token_is_treated_as_unavailable(forgecore):
 def test_attestor_from_env_needs_url_and_token():
     assert m.ForgeCoreAttestor.from_env({"AUTODEV_URL": "http://x"}) is None
     assert m.ForgeCoreAttestor.from_env({"AUTODEV_URL": "http://x", "AUTODEV_API_BEARER_TOKEN": "t"}) is not None
+
+
+# ---- WU-10 finding: unicode line separators must not hide added content from the scanners
+@pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\x0b", "\x0c"])
+def test_unicode_line_separators_do_not_hide_added_lines(sep):
+    tok = "ghp_" + "A" * 36
+    patch = f"--- a/x.py\n+++ b/x.py\n@@ -0,0 +1,2 @@\n+a = 1{sep}{tok}\n+b = 2\n"
+    lines = list(m.iter_patch_lines(patch))
+    assert [l.kind for l in lines] == ["add", "add"]
+    assert tok in lines[0].text
+
+
+def test_scan_diff_catches_token_behind_line_separator(tmp_path):
+    import subprocess, sys as _sys
+    tok = "ghp_" + "B" * 36
+    patch = tmp_path / "p.diff"
+    patch.write_text(f"--- a/x.py\n+++ b/x.py\n@@ -0,0 +1,2 @@\n+a = 1\u2028{tok}\n+b = 2\n", encoding="utf-8")
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    r = subprocess.run([_sys.executable, os.path.join(root, "gemctl.py"), "scan-diff", "--path", "x.py",
+                        "--patch", str(patch), "--fail-on-critical"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "secret" in r.stdout.lower(), r.stdout + r.stderr
+
+
+def test_crlf_patches_still_parse():
+    patch = "--- a/x.py\r\n+++ b/x.py\r\n@@ -1,1 +1,2 @@\r\n ctx\r\n+new\r\n"
+    assert [(l.kind, l.text) for l in m.iter_patch_lines(patch)] == [("ctx", "ctx"), ("add", "new")]
