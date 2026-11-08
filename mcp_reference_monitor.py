@@ -387,6 +387,8 @@ class ThinkStreamFilter:
     emits reasoning first and only a closing </think> (set `assume_open=True`).
     """
     OPEN, CLOSE = "<think>", "</think>"
+    # ASCII-only case fold: str.lower() can change length ("İ" -> "i̇"), which misaligned indices into buf.
+    _FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
     def __init__(self, assume_open: bool = False) -> None:
         self.inside = assume_open
@@ -397,7 +399,7 @@ class ThinkStreamFilter:
         self.buf += chunk
         out: List[str] = []
         while True:
-            low = self.buf.lower()
+            low = self.buf.translate(self._FOLD)
             tag = self.CLOSE if self.inside else self.OPEN
             idx = low.find(tag)
             if idx >= 0:
