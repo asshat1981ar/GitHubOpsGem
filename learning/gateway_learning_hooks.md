@@ -98,3 +98,20 @@ TOOL ISSUES:
     create the replaced parents with system permissions or the test proves less than it seems.
 ROUTE: tool-patterns + GOAL_CONTRACT evidence; doc's "Do today" command corrected
 ```
+
+## 7. Independent review of WU-07 money paths (2026-11-07)
+
+A fresh sub-agent that had not written the code found 3 high, 5 medium and 2 low defects in code that passed
+190 of my own tests and a 9/9 simulation. Confirmed by reproduction:
+- systemd `EnvironmentFile=` keeps inline `# comments` in values → controller crash-loop under real systemd. My
+  test stub loaded the file with `sh`, which strips them, so the test agreed with the bug.
+- restart gap: last replica count not persisted → GPU time while the controller was down went unmetered.
+- unreadable ledger reset both caps to $0; no fsync before rename.
+- uninstall left the B200 up; wake during drain reported ready and was lost; restarts dropped in-flight leases.
+
+LESSONS (route: tool-patterns + this file):
+1. A stand-in must reproduce the real component's parsing, not a convenient approximation (systemd ≠ sh).
+2. For anything that meters money: persist every input the meter needs across restarts, fsync, and fail toward
+   "capped", never toward "zero spent".
+3. Self-tests confirm the author's model of the world; an independent adversarial reviewer tests the world.
+   Keep "fresh-eyes review for money, secrets, merges" as a non-optional step (now in state/SELF_PROMPT.md).
