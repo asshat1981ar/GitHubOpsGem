@@ -326,3 +326,21 @@ def test_inline_comments_are_moved_and_other_bad_values_refused(box):
     r = box.run("--yes")
     assert r.returncode == 1 and "GEM_NOTE" in r.stderr and "whitespace" in r.stderr
     assert "two words" not in r.stderr                    # values (they may be secrets) are never echoed
+
+
+@needs_root
+def test_upgrade_from_single_token_v1_rotates_the_operator_token(box):
+    r = box.run("--api-key-file", box.keyfile, "--accept-autodelete-risk", "--yes")
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [l for l in open(box.env).read().splitlines() if not l.startswith(("GEM_LIFECYCLE_FEED_TOKEN=",
+                                                                                  "GEM_LIFECYCLE_SESSION_TOKEN="))]
+    old = box.envmap()["GEM_LIFECYCLE_TOKEN"]
+    with open(box.env, "w") as fh:                  # what a v1 (single-token) env file looks like
+        fh.write("\n".join(lines) + "\n")
+    r = box.run("--yes")
+    assert r.returncode == 0, r.stdout + r.stderr
+    env = box.envmap()
+    assert env["GEM_LIFECYCLE_TOKEN"] != old and "rotated the operator token" in r.stdout
+    assert env["GEM_LIFECYCLE_FEED_TOKEN"] and env["GEM_LIFECYCLE_SESSION_TOKEN"]
+    r = box.run("--yes")                            # later upgrades keep it
+    assert box.envmap()["GEM_LIFECYCLE_TOKEN"] == env["GEM_LIFECYCLE_TOKEN"]

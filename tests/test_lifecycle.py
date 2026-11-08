@@ -1221,3 +1221,67 @@ def test_concurrent_ticks_and_wakes_neither_interleave_nor_double_scale():
     assert fake.max_active == 1                           # one Fireworks call at a time
     assert [n for _, n in fake.calls] == [1]              # exactly one scale-up for three wakes
     assert sorted(codes) == [200, 200, 202] and ctl.heavy
+
+
+# ---------------------------------------------------------------- re-review regressions (R1, R2)
+
+def test_litellm_retry_with_the_same_call_id_counts_as_in_flight_again():
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    ctl = gl.Lifecycle(_cfg(), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    ctl.wake("heavy")
+    ctl.touch("start", "call-1")
+    ctl.touch("end", "call-1")                      # attempt 1 failed (e.g. a 500)
+    code, body = ctl.touch("start", "call-1")       # LiteLLM retries with the same id
+    assert code == 200 and "ignored" not in body and "call-1" in ctl.inflight
+    for _ in range(40):                             # a 10-minute generation on the retry
+        clock.advance(15)
+        ctl.tick()
+    assert fake.replicas == 1 and not [c for c in ctl.scale_calls if c[1] == 0]
+
+
+def test_end_before_start_still_ignores_the_late_start():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = gl.Lifecycle(_cfg(), gl.FakeFireworks(clock), clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.touch("end", "c9")
+    code, body = ctl.touch("start", "c9")
+    assert body.get("ignored") == "call already ended" and "c9" not in ctl.inflight
+
+
+def test_restart_after_scaling_to_zero_bills_only_the_drain(tmp_path):
+    state = str(tmp_path / "lifecycle.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = gl.Lifecycle(_cfg(state_path=state), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    a.recheck()
+    a.set_heavy(True)
+    clock.advance(15)
+    a.tick()
+    a.set_heavy(False)                              # uninstall path: desired 0, a replica may still be draining
+    before = a.spend()[1]
+    clock.advance(3 * 86400)                        # controller gone for three days; deployment drained
+    fake.replicas = 0
+    b = gl.Lifecycle(_cfg(state_path=state), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    b.recheck()
+    b.tick()
+    drain_usd = gl.DRAIN_BOUND_S * 4 * 13 / 3600
+    assert b.spend()[1] <= before + drain_usd + 0.01
+    assert any(e["event"] == "restart_gap_bounded" for e in b.events)
+    assert b.wake("heavy")[0] == 202                # not locked out for the week
+
+
+def test_restart_while_deployment_is_still_up_bills_the_whole_gap(tmp_path):
+    state = str(tmp_path / "lifecycle.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = gl.Lifecycle(_cfg(state_path=state), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    a.recheck()
+    a.set_heavy(False)                              # saved desired 0 ...
+    fake.scale(1)                                   # ... but something woke it while no controller ran
+    clock.advance(1800)
+    b = gl.Lifecycle(_cfg(state_path=state), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    b.recheck()
+    b.tick()
+    assert not any(e["event"] == "restart_gap_bounded" for e in b.events)
+    assert b.spend()[0] >= 1800 * 4 * 13 / 3600 - 0.01

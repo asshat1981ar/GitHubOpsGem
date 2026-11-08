@@ -62,6 +62,7 @@ _DUR_PART = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
 CLOCK_STEP_S = 5.0          # wall and monotonic deltas further apart than this are a clock step
 LOOP_SLACK_S = 60.0         # most a slow loop iteration adds to poll_s (GET, scale and recheck timeouts, firectl)
 MAX_TRACKED = 1000          # sessions and in-flight requests each; more get 429
+DRAIN_BOUND_S = 300  # longest drain billed after a restart when the last state was scaled to zero
 ENDED_KEEP = 512            # recently ended call ids remembered (each for 2 x the request lease)
 MAX_DELAY_S = 86400.0
 ROUTE_ROLES: Dict[Tuple[str, str], Tuple[str, ...]] = {
@@ -515,6 +516,7 @@ class Lifecycle:
         self.api_errors = 0
         self.loop_period_s: Optional[float] = None       # last measured interval between ticks (monotonic)
         self.saved_replicas = 0                          # what the previous process last saw (replicas or desired)
+        self.saved_desired = 0                           # ... and whether it had asked for any replica
         self.saved_gpus = 0
         self.events: Deque[dict] = collections.deque(maxlen=100)
         self.scale_calls: List[Tuple[float, int, str]] = []
@@ -576,6 +578,7 @@ class Lifecycle:
             last_tick, last_traffic = _opt_float(st.get("last_tick")), _opt_float(st.get("last_traffic"))
             lost_until = _opt_float(st.get("ledger_lost_until"))
             replicas = max(int(st.get("replicas") or 0), int(st.get("desired") or 0))
+            desired = int(st.get("desired") or 0)
             gpus = int(st.get("gpus") or 0)
             inflight = _recent(st.get("inflight"), now, self.cfg.request_lease_s)
             sessions = _recent(st.get("sessions"), now, self.cfg.session_ttl_s)
@@ -595,6 +598,7 @@ class Lifecycle:
         self.heavy = bool(st.get("heavy"))
         self._resume_reason = st.get("wake_reason") or ("heavy" if self.heavy else None)
         self.saved_replicas, self.saved_gpus, self.ledger_lost_until = replicas, gpus, lost_until
+        self.saved_desired = desired
         self.inflight, self.sessions = inflight, sessions
 
     def _save(self) -> None:
@@ -685,9 +689,17 @@ class Lifecycle:
         if first:
             if last_wall is None:                        # first start ever: nothing to bill yet
                 return
-            gap = max(0.0, now - last_wall)              # wall time no process was watching: bill all of it
+            gap = max(0.0, now - last_wall)              # wall time no process was watching
             replicas = max([self.saved_replicas] + [s.replicas for s in seen])
             gpus = max([self.saved_gpus] + [s.gpus for s in seen]) or self.cfg.default_gpus
+            active_now = any(s.replicas > 0 or s.desired > 0 for s in seen)
+            if self.saved_desired == 0 and not active_now and gap > DRAIN_BOUND_S:
+                # The previous process had already scaled to zero and the deployment is down now: what it can have
+                # billed since is the drain, not the whole outage (re-review R2). A stray wake in between would
+                # still be up, or would have been visible as active_now.
+                self._log("restart_gap_bounded", seconds=round(gap), billed_s=DRAIN_BOUND_S,
+                          note="deployment was already scaled to zero; reconcile with Fireworks billing if unsure")
+                gap = float(DRAIN_BOUND_S)
             self._log("restart_gap_billed", seconds=round(gap), replicas=replicas, gpus=gpus,
                       usd=round(gap * replicas * gpus * self.cfg.gpu_rate_usd_per_hour / 3600.0, 2))
         else:
@@ -1006,11 +1018,16 @@ class Lifecycle:
                     return 429, {"ok": False, "error": f"too many in-flight requests ({MAX_TRACKED})"}
                 self.inflight[call_id] = now
             else:
-                self.inflight.pop(call_id, None)
-                self.ended[call_id] = now
-                self.ended.move_to_end(call_id)
-                while len(self.ended) > ENDED_KEEP:
-                    self.ended.popitem(last=False)
+                # Only an end that arrives before its start is remembered (to ignore that late start). A normal
+                # end clears the in-flight entry and nothing else: LiteLLM retries reuse the same call id, and a
+                # retry's start must count again (re-review R1).
+                if self.inflight.pop(call_id, None) is None:
+                    self.ended[call_id] = now
+                    self.ended.move_to_end(call_id)
+                    while len(self.ended) > ENDED_KEEP:
+                        self.ended.popitem(last=False)
+                else:
+                    self.ended.pop(call_id, None)
             self.last_traffic = now
             self._save()
             return 200, {"ok": True, "inflight": len(self.inflight)}

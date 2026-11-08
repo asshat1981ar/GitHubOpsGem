@@ -197,17 +197,20 @@ except OSError as exc:
     sys.exit(f"controller unreachable at {base} ({exc})")
 if code >= 300:
     sys.exit(f"the controller could not scale it down: HTTP {code} {body}")
-deadline = time.monotonic() + 30
+deadline = time.monotonic() + 120
 while True:
     try:
         _, st = call("GET", "/status")
     except OSError:
         st = {}
-    if st.get("desired") == 0:
-        print(f"B200 scaled to zero (Fireworks reports desired 0, replicas {st.get('replicas')})")
+    if st.get("desired") == 0 and st.get("replicas") == 0:
+        print("B200 scaled to zero (Fireworks reports 0 desired, 0 running)")
         sys.exit(0)
     if time.monotonic() > deadline:
-        sys.exit(f"Fireworks still reports {st.get('desired')} desired replica(s) after 30 s")
+        if st.get("desired") == 0:   # asked to drain and draining: safe to stop (restart billing is bounded)
+            print(f"B200 draining (desired 0, {st.get('replicas')} still running after 120 s)")
+            sys.exit(0)
+        sys.exit(f"Fireworks still reports {st.get('desired')} desired replica(s) after 120 s")
     time.sleep(1)
 PY
 }
@@ -322,6 +325,12 @@ else
   ok "Fireworks API key kept"
 fi
 
+# A v1 install (single token, no feed token) handed its token to LiteLLM and to Claude Code's environment, so the
+# operator token is rotated once on the upgrade to role tokens (re-review: old token stayed valid as operator).
+if [[ -n "$(envget GEM_LIFECYCLE_TOKEN)" && -z "$(envget GEM_LIFECYCLE_FEED_TOKEN)" ]]; then
+  "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))' | envset_stdin GEM_LIFECYCLE_TOKEN
+  warn "rotated the operator token: the v1 token was shared with LiteLLM and Claude Code; update ~/.gem/operator.token"
+fi
 for pair in operator:GEM_LIFECYCLE_TOKEN feed:GEM_LIFECYCLE_FEED_TOKEN session:GEM_LIFECYCLE_SESSION_TOKEN; do
   role="${pair%%:*}" var="${pair#*:}"
   if [[ -z "$(envget "$var")" ]]; then
