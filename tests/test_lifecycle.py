@@ -335,14 +335,14 @@ def live():
     lc.close()
 
 
-def _http(url, method="GET", body=None, token=TOKEN, raw=None):
+def _http(url, method="GET", body=None, token=TOKEN, raw=None, timeout=5.0):
     import urllib.error
     import urllib.request
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Authorization": f"Bearer {token}"} if token else {})
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -1116,3 +1116,108 @@ def test_cap_margin_follows_the_measured_loop_period():
     gl._preload(ctl, day_usd=23.0, week_usd=23.0)         # $3 left > the bounded (15+60 s) margin of $2.17
     ctl.tick()
     assert ctl.capped is None
+
+
+# The state lock is never held across Fireworks I/O: the LiteLLM callback's 1 s posts must not be dropped.
+
+class SlowFireworks(gl.FakeFireworks):
+    """Real-clock deployment whose GET and/or scale block, counting how many calls overlap."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.get_delay = self.scale_delay = 0.0
+        self.in_call = threading.Event()
+        self.active = self.max_active = 0
+        self._count = threading.Lock()
+
+    def _slow(self, delay, fn, *args):
+        with self._count:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.in_call.set()
+        try:
+            time.sleep(delay)
+            return fn(*args)
+        finally:
+            with self._count:
+                self.active -= 1
+
+    def get(self):
+        return self._slow(self.get_delay, super().get)
+
+    def scale(self, n):
+        return self._slow(self.scale_delay, super().scale, n)
+
+
+def _served(ctl):
+    srv = gl.start_server(ctl, "127.0.0.1", 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def test_touch_during_a_slow_fireworks_get_is_answered_and_keeps_the_gpu_up():
+    fake = SlowFireworks(time.time, cold_start_s=0)
+    ctl = gl.Lifecycle(_cfg(idle_sleep_s=1.0), fake, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    assert ctl.wake("heavy")[0] == 202
+    ctl.tick()
+    assert fake.replicas == 1
+    time.sleep(1.2)                                       # idle by the rule: the next tick would sleep it
+    srv, url = _served(ctl)
+    try:
+        fake.get_delay = 3.0
+        fake.in_call.clear()
+        ticker = threading.Thread(target=ctl.tick)
+        ticker.start()
+        assert fake.in_call.wait(2)                       # the tick is now inside the 3 s GET
+        t0 = time.monotonic()
+        code, body = _http(url + "/touch", "POST", {"event": "start", "call_id": "c1"}, token=FEED, timeout=1.0)
+        took = time.monotonic() - t0
+        assert code == 200 and took < 1.0 and "c1" in ctl.inflight, (code, took)
+        assert _http(url + "/status", token=SESSION, timeout=1.0)[0] == 200
+        assert ticker.is_alive()                          # answered while the GET was still in flight
+        ticker.join(10)
+        assert not [c for c in ctl.scale_calls if c[1] == 0] and fake.desired == 1   # in flight: not idle
+    finally:
+        srv.shutdown()
+
+
+def test_touch_during_a_slow_scale_call_is_answered():
+    fake = SlowFireworks(time.time, cold_start_s=0)
+    ctl = gl.Lifecycle(_cfg(), fake, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    srv, url = _served(ctl)
+    try:
+        fake.scale_delay = 3.0
+        fake.in_call.clear()
+        result = {}
+        waker = threading.Thread(target=lambda: result.update(code=ctl.set_heavy(True)[0]))
+        waker.start()
+        deadline = time.monotonic() + 2
+        while fake.active == 0 or not ctl.snapshot:       # wait until the PATCH itself is in flight
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        t0 = time.monotonic()
+        code, _ = _http(url + "/touch", "POST", {"event": "start", "call_id": "c2"}, token=FEED, timeout=1.0)
+        assert code == 200 and time.monotonic() - t0 < 1.0 and "c2" in ctl.inflight
+        waker.join(10)
+        assert result["code"] == 202 and ctl.heavy and fake.calls[-1][1] == 1
+    finally:
+        srv.shutdown()
+
+
+def test_concurrent_ticks_and_wakes_neither_interleave_nor_double_scale():
+    fake = SlowFireworks(time.time, cold_start_s=30)
+    ctl = gl.Lifecycle(_cfg(), fake, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    fake.get_delay = fake.scale_delay = 0.2
+    codes = []
+    threads = [threading.Thread(target=lambda: codes.append(ctl.set_heavy(True)[0])) for _ in range(3)]
+    threads += [threading.Thread(target=ctl.tick) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+    assert fake.max_active == 1                           # one Fireworks call at a time
+    assert [n for _, n in fake.calls] == [1]              # exactly one scale-up for three wakes
+    assert sorted(codes) == [200, 200, 202] and ctl.heavy

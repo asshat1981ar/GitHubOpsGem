@@ -490,7 +490,8 @@ class Lifecycle:
             mono = boottime if clock is time.time else getattr(clock, "mono", clock)
         self.cfg, self.client, self.clock, self.mono = cfg, client, clock, mono
         self.out, self.firectl = out, firectl
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()                    # state; never held across network I/O
+        self._tick_guard = threading.Lock()              # one observe-decide-act cycle at a time
         self.snapshot: Optional[Snapshot] = None
         self.gpu_seconds: Dict[str, float] = {}
         self.last_tick: Optional[float] = None           # wall time of the last accrual (persisted)
@@ -700,16 +701,29 @@ class Lifecycle:
             self.gpu_seconds[key] = self.gpu_seconds.get(key, 0.0) + gap * replicas * gpus
 
     # ---- actions on Fireworks
-    def _scale(self, now: float, replicas: int, reason: str) -> bool:
+    #
+    # Locking: `self.lock` guards controller state and is never held across network I/O, so /touch, /session/*
+    # and /status always answer at once. `_tick_guard` (not reentrant) serializes the observe-decide-act cycles
+    # (tick, wake, sleep now, recheck): it is held across the Fireworks GET and PATCH, so two cycles never
+    # interleave and a decision can't be made twice before its scale call is recorded. Order: _tick_guard first,
+    # then self.lock; never take _tick_guard while holding self.lock.
+
+    def _send_scale(self, replicas: int) -> Optional[str]:
+        """The Fireworks call alone. Caller holds _tick_guard and not self.lock. Returns an error or None."""
+        if self.cfg.dry:
+            return None
         try:
-            if self.cfg.dry:
-                self._log("scale_dry_run", replicas=replicas, reason=reason)
-            else:
-                self.client.scale(replicas)
-                self._log("scale", replicas=replicas, reason=reason)
+            self.client.scale(replicas)
         except FireworksError as exc:
-            self._log("scale_error", replicas=replicas, reason=reason, detail=str(exc))
+            return str(exc)
+        return None
+
+    def _record_scale(self, now: float, replicas: int, reason: str, err: Optional[str]) -> bool:
+        """Caller holds self.lock."""
+        if err is not None:
+            self._log("scale_error", replicas=replicas, reason=reason, detail=err)
             return False
+        self._log("scale_dry_run" if self.cfg.dry else "scale", replicas=replicas, reason=reason)
         self.scale_calls.append((now, replicas, reason))
         if self.snapshot is not None and not self.cfg.dry:   # DRY changed nothing: keep reporting what is there
             self.snapshot = dataclasses.replace(self.snapshot, desired=replicas)
@@ -720,27 +734,47 @@ class Lifecycle:
             self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
         return True
 
-    def _down(self, now: float, snap: Snapshot, reason: str) -> bool:
+    def _act(self, now: float, action: Tuple[int, str]) -> Optional[str]:
+        """Carry out a scale decided under self.lock, then record it. Caller holds _tick_guard only."""
+        replicas, reason = action
+        err = self._send_scale(replicas)
+        with self.lock:
+            self._record_scale(now, replicas, reason, err)
+            self._save()
+        return err
+
+    def _down(self, now: float, snap: Snapshot, reason: str) -> Optional[Tuple[int, str]]:
+        """The scale-down to send, if one is needed. Caller holds self.lock."""
         stale = self.last_down_at is None or now - self.last_down_at > 120
         if snap.desired > 0 or (snap.replicas > 0 and stale):
-            return self._scale(now, 0, reason)
+            return 0, reason
         self.heavy = False                               # already draining; clear intents so nothing re-fires
         self.wake_at = self.wake_reason = None
         self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
-        return True
+        return None
 
     # ---- the loop body
     def tick(self) -> None:
+        with self._tick_guard:
+            self._tick()
+
+    def _tick(self) -> None:
+        """One observe-decide-act cycle. Caller holds _tick_guard and not self.lock."""
+        try:
+            doc: Optional[dict] = self.client.get()
+            err: Optional[FireworksError] = None
+        except FireworksError as exc:
+            doc, err = None, exc
         with self.lock:
-            now = self._now()
+            now = self._now()                            # taken once the GET has returned
             prev = self.snapshot
-            try:
-                cur: Optional[Snapshot] = Snapshot.from_api(self.client.get(), self.cfg.default_gpus)
+            if err is None:
+                cur: Optional[Snapshot] = Snapshot.from_api(doc or {}, self.cfg.default_gpus)
                 self.api_errors = 0
-            except FireworksError as exc:
+            else:
                 self.api_errors += 1
-                self._log("api_error", detail=str(exc), consecutive=self.api_errors)
-                cur = prev                                   # keep metering on the last known replica count
+                self._log("api_error", detail=str(err), consecutive=self.api_errors)
+                cur = prev                               # keep metering on the last known replica count
             self._accrue(now, prev, cur)
             if cur is None:
                 self._save()
@@ -755,11 +789,14 @@ class Lifecycle:
             if not cur.active:
                 self.heavy = False
                 self.wake_at = self.wake_reason = None
-            self._enforce(now, cur)
+            action = self._enforce(now, cur)
             self._resume_reason = None
             self._save()
+        if action is not None:
+            self._act(now, action)
 
-    def _enforce(self, now: float, snap: Snapshot) -> None:
+    def _enforce(self, now: float, snap: Snapshot) -> Optional[Tuple[int, str]]:
+        """Apply the policy to fresh state; return the scale call to make, if any. Caller holds self.lock."""
         cap = self._cap_hit(now)
         if cap:
             if self.capped != cap:
@@ -767,9 +804,7 @@ class Lifecycle:
                 self._log("cap_tripped", period=cap, spend_day_usd=round(day, 2), spend_week_usd=round(week, 2),
                           resets_at=self._resets_at(now, cap))
             self.capped = cap
-            if snap.active:
-                self._down(now, snap, f"cap_{cap}")
-            return
+            return self._down(now, snap, f"cap_{cap}") if snap.active else None
         if self.capped:
             self._log("cap_cleared", period=self.capped)
             self.capped = None
@@ -777,8 +812,7 @@ class Lifecycle:
         if self.wake_disabled and snap.active and self.wake_at is None:
             transient = bool(self.report and self.report.info.get("transient"))
             if not (transient and self._resume_reason):
-                self._down(now, snap, "guard")               # nobody may wake it while the guard fails
-                return
+                return self._down(now, snap, "guard")    # nobody may wake it while the guard fails
             # Fireworks didn't answer the startup check: a run that was in progress keeps going (resumed below);
             # the loop rechecks until it gets an answer, and a hard failure then stops new wakes again.
 
@@ -792,18 +826,15 @@ class Lifecycle:
             else:
                 self.sleep_at = None
                 if snap.active:
-                    self._down(now, snap, reason)
-                    return
+                    return self._down(now, snap, reason)
 
         if snap.desired > 0 and not snap.up and self.wake_at is not None and now - self.wake_at > self.cfg.wake_timeout_s:
             self._log("wake_timeout", waited_s=round(now - self.wake_at))
-            self._down(now, snap, "wake_timeout")
-            return
+            return self._down(now, snap, "wake_timeout")
 
         if snap.up and not self.inflight:
             if now - self._idle_since(now) >= self.cfg.idle_sleep_s:
-                self._down(now, snap, "idle")
-                return
+                return self._down(now, snap, "idle")
 
         if snap.active and self.wake_at is None:
             if self._resume_reason:                          # a run that was in progress when we restarted
@@ -812,7 +843,8 @@ class Lifecycle:
             else:                                            # e.g. a LiteLLM fallback hit the cold B200
                 self._log("unrequested_wake", note="Fireworks autoscaler woke it; only heavy runs and 429 "
                           "storms may wake the B200")
-                self._down(now, snap, "unrequested")
+                return self._down(now, snap, "unrequested")
+        return None
 
     def _idle_since(self, now: float) -> float:
         marks = [t for t in (self.last_traffic, self.ready_since) if t is not None]
@@ -835,88 +867,101 @@ class Lifecycle:
 
     # ---- checks
     def recheck(self) -> Tuple[int, dict]:
-        with self.lock:
-            self._now()
-            try:
-                doc = self.client.get()
+        with self._tick_guard:
+            try:                                         # network and firectl (up to 20 s) outside self.lock
+                doc: Optional[dict] = self.client.get()
+                err: Optional[FireworksError] = None
             except FireworksError as exc:
-                self.report = CheckReport([f"cannot read the deployment: {exc}"], [], {"transient": True})
-            else:
-                fc = None if find_autodelete(doc)[0] or self.cfg.autodelete_verified else self.firectl(self.cfg.deployment)
-                self.report = check_deployment(doc, self.cfg, fc)
-                if self.snapshot is None:                   # so /status is meaningful before the first tick
-                    self.snapshot = Snapshot.from_api(doc, self.cfg.default_gpus)
-            self.wake_disabled = "; ".join(self.report.hard) or None
-            for msg in self.report.hard:
-                self._log("check_failed", severity="CRITICAL", detail=msg)
-            for msg in self.report.warn:
-                self._log("check_warning", severity="WARNING", detail=msg)
-            if self.report.ok:
-                self._log("check_passed", **self.report.info)
-            return (200 if self.report.ok else 503), self.report.as_dict()
+                doc, err = None, exc
+            fc = None
+            if doc is not None and not (find_autodelete(doc)[0] or self.cfg.autodelete_verified):
+                fc = self.firectl(self.cfg.deployment)
+            with self.lock:
+                self._now()
+                if err is not None or doc is None:
+                    self.report = CheckReport([f"cannot read the deployment: {err}"], [], {"transient": True})
+                else:
+                    self.report = check_deployment(doc, self.cfg, fc)
+                    if self.snapshot is None:               # so /status is meaningful before the first tick
+                        self.snapshot = Snapshot.from_api(doc, self.cfg.default_gpus)
+                self.wake_disabled = "; ".join(self.report.hard) or None
+                for msg in self.report.hard:
+                    self._log("check_failed", severity="CRITICAL", detail=msg)
+                for msg in self.report.warn:
+                    self._log("check_warning", severity="WARNING", detail=msg)
+                if self.report.ok:
+                    self._log("check_passed", **self.report.info)
+                return (200 if self.report.ok else 503), self.report.as_dict()
 
     # ---- requests
-    def wake(self, reason: str) -> Tuple[int, dict]:
-        with self.lock:
-            self.tick()
-            now = self._now()
-            if self.wake_disabled:
-                self._log("wake_refused", reason=reason, why="guard")
-                return 503, {"ok": False, "refused": "guard", "detail": self.wake_disabled}
-            left, period = self.headroom(now)
-            reserve = self.cfg.wake_reserve_s * self._usd_per_replica_s()
-            cap = self._cap_hit(now)
-            if cap or left < reserve:
-                period = cap or period
-                self._log("wake_refused", reason=reason, why=f"cap_{period}", headroom_usd=round(left, 2))
-                return 409, {"ok": False, "refused": f"cap_{period}", "headroom_usd": round(max(left, 0), 2),
-                             "reserve_usd": round(reserve, 2), "resets_at": self._resets_at(now, period)}
-            self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
-            snap = self.snapshot
-            if snap is not None and snap.desired > 0:        # already up or waking
-                self.wake_at = self.wake_at or now
-                self.wake_reason = self.wake_reason or reason
+    def wake(self, reason: str, heavy: bool = False) -> Tuple[int, dict]:
+        with self._tick_guard:
+            self._tick()
+            with self.lock:
+                now = self._now()
+                if self.wake_disabled:
+                    self._log("wake_refused", reason=reason, why="guard")
+                    return 503, {"ok": False, "refused": "guard", "detail": self.wake_disabled}
+                left, period = self.headroom(now)
+                reserve = self.cfg.wake_reserve_s * self._usd_per_replica_s()
+                cap = self._cap_hit(now)
+                if cap or left < reserve:
+                    period = cap or period
+                    self._log("wake_refused", reason=reason, why=f"cap_{period}", headroom_usd=round(left, 2))
+                    return 409, {"ok": False, "refused": f"cap_{period}", "headroom_usd": round(max(left, 0), 2),
+                                 "reserve_usd": round(reserve, 2), "resets_at": self._resets_at(now, period)}
+                self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
+                snap = self.snapshot
+                if snap is not None and snap.desired > 0:    # already up or waking
+                    self.wake_at = self.wake_at or now
+                    self.wake_reason = self.wake_reason or reason
+                    self.heavy = self.heavy or heavy
+                    self._save()
+                    return 200, {"ok": True, "b200": snap.label, "headroom_usd": round(left, 2)}
+            err = self._act(now, (1, f"wake_{reason}"))      # asleep, or still draining from a scale-down
+            if err is not None:
+                return 502, {"ok": False, "refused": "scale_error", "detail": err}
+            with self.lock:
+                self.wake_at, self.wake_reason = now, reason
+                self.heavy = self.heavy or heavy
                 self._save()
-                return 200, {"ok": True, "b200": snap.label, "headroom_usd": round(left, 2)}
-            if not self._scale(now, 1, f"wake_{reason}"):    # asleep, or still draining from a scale-down
-                return 502, {"ok": False, "refused": "scale_error", "detail": self.events[-1].get("detail")}
-            self.wake_at, self.wake_reason = now, reason
-            self._save()
-            return 202, {"ok": True, "b200": "waking", "headroom_usd": round(left, 2),
-                         "gpu_minutes_left": round(left / (self._usd_per_replica_s() * 60), 1)}
+                return 202, {"ok": True, "b200": "waking", "headroom_usd": round(left, 2),
+                             "gpu_minutes_left": round(left / (self._usd_per_replica_s() * 60), 1)}
+
+    def _schedule_sleep(self, now: float, delay_s: float, reason: str) -> Tuple[int, dict]:
+        """Caller holds self.lock."""
+        self.sleep_at, self.sleep_reason, self.sleep_requested_at = now + delay_s, reason, now
+        self._log("sleep_scheduled", reason=reason, at=iso(self.sleep_at))
+        return 202, {"ok": True, "sleep_at": iso(self.sleep_at)}
 
     def sleep(self, delay_s: float, reason: str) -> Tuple[int, dict]:
-        with self.lock:
-            if not math.isfinite(delay_s):
-                raise ValueError("delay_s must be a finite number")
-            delay_s = min(max(delay_s, 0.0), MAX_DELAY_S)
-            if delay_s <= 0:
-                self.tick()
+        if not math.isfinite(delay_s):
+            raise ValueError("delay_s must be a finite number")
+        delay_s = min(max(delay_s, 0.0), MAX_DELAY_S)
+        if delay_s > 0:
+            with self.lock:
+                return self._schedule_sleep(self._now(), delay_s, reason)
+        with self._tick_guard:
+            self._tick()
+            with self.lock:
                 now = self._now()
                 snap = self.snapshot
-                if snap is None:                             # never read the deployment: ask Fireworks anyway
-                    done = self._scale(now, 0, reason)
+                if snap is None:                         # never read the deployment: ask Fireworks anyway
+                    action: Optional[Tuple[int, str]] = (0, reason)
                 else:
-                    done = self._down(now, snap, reason) if snap.active else True
+                    action = self._down(now, snap, reason) if snap.active else None
                 self._save()
-                if not done:
-                    return 502, {"ok": False, "refused": "scale_error", "detail": self.events[-1].get("detail")}
-                return 202, {"ok": True, "sleeping": "now"}
-            now = self._now()
-            self.sleep_at, self.sleep_reason, self.sleep_requested_at = now + delay_s, reason, now
-            self._log("sleep_scheduled", reason=reason, at=iso(self.sleep_at))
-            return 202, {"ok": True, "sleep_at": iso(self.sleep_at)}
+            err = self._act(now, action) if action is not None else None
+        if err is not None:
+            return 502, {"ok": False, "refused": "scale_error", "detail": err}
+        return 202, {"ok": True, "sleeping": "now"}
 
     def set_heavy(self, on: bool) -> Tuple[int, dict]:
+        if on:
+            return self.wake("heavy", heavy=True)
         with self.lock:
-            if not on:
-                self.heavy = False
-                return self.sleep(0, "heavy_off")
-            code, body = self.wake("heavy")
-            if code < 300:
-                self.heavy = True
-                self._save()
-            return code, body
+            self.heavy = False
+        return self.sleep(0, "heavy_off")
 
     def session_start(self, session_id: str) -> Tuple[int, dict]:
         with self.lock:
@@ -933,14 +978,16 @@ class Lifecycle:
 
     def session_end(self, session_id: str) -> Tuple[int, dict]:
         with self.lock:
-            self._now()
+            now = self._now()
             known = self.sessions.pop(session_id, None) is not None
             self._save()
             # Only the end of a session we know about may put the B200 to sleep: an unknown id (lost registry,
             # another client) must not cut short a run that a live session is using.
-            if known and not self.sessions and (self.snapshot is None or self.snapshot.active):
-                return self.sleep(self.cfg.session_end_sleep_s, "session_end")
-            return 200, {"ok": True, "sessions": len(self.sessions), "known": known}
+            if not (known and not self.sessions and (self.snapshot is None or self.snapshot.active)):
+                return 200, {"ok": True, "sessions": len(self.sessions), "known": known}
+            if self.cfg.session_end_sleep_s > 0:         # scheduled under the same lock as the check above
+                return self._schedule_sleep(now, min(self.cfg.session_end_sleep_s, MAX_DELAY_S), "session_end")
+        return self.sleep(0, "session_end")              # configured to sleep at once: needs the tick guard
 
     def touch(self, event: str, call_id: str) -> Tuple[int, dict]:
         with self.lock:
@@ -974,10 +1021,10 @@ class Lifecycle:
             self._expire(now)
             self.storm.append(now)
             self._log("rate_limited", model_group=model_group, in_window=len(self.storm))
-            if len(self.storm) >= self.cfg.storm_count:
-                self.storm.clear()
-                return self.wake("429_storm")
-            return 202, {"ok": True, "counted": len(self.storm), "needed": self.cfg.storm_count}
+            if len(self.storm) < self.cfg.storm_count:
+                return 202, {"ok": True, "counted": len(self.storm), "needed": self.cfg.storm_count}
+            self.storm.clear()
+        return self.wake("429_storm")                    # outside self.lock: wake takes the tick guard first
 
     # ---- views
     def _brief(self, now: float) -> dict:
