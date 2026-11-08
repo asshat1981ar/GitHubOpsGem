@@ -1,18 +1,6 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(python3 -m pytest:*)",
-      "Bash(python3 -I probes.py:*)",
-      "Bash(python3 -I lifecycle/gem_lifecycle.py dryrun)",
-      "Bash(python3 -I gemctl.py scan-diff:*)",
-      "Bash(python3 -I gemctl.py debt:*)",
-      "Bash(python3 -I gemctl.py version)",
-      "Bash(actionlint:*)",
-      "Bash(zizmor --offline:*)",
-      "Bash(git status)",
-      "Bash(git diff:*)",
-      "Bash(git log:*)"
-    ],
+    "allow": [],
     "deny": [
       "Read(./.env*)",
       "Read(**/*.pem)",
@@ -26,7 +14,9 @@
       "Bash(python3 -I gemctl.py heavy:*)",
       "Bash(firectl:*)",
       "Bash(sudo:*)",
-      "Bash(git push --force*)"
+      "Bash(git push --force*)",
+      "Read(./.git/config)",
+      "Read(./.git/**)"
     ]
   }
 }

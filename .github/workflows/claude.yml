@@ -1,8 +1,14 @@
 # @claude in issues, PR comments and PR reviews (tag mode). Owner-only on a public repository.
 # Prerequisites and switches: docs/claude-automation.md
+# Trust model: tag mode may check out the PR head, so (1) cross-repository PRs are refused (fork step and
+# the review-event if:), (2) no build, test, package-manager or repo-script command is allowlisted (only
+# read-only git/gh; edits use the action's file tools), (3) CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 strips
+# secrets from subprocesses. Claude cannot run tests here; CI runs on its pushes without secrets.
+# Residual risk: a same-repo branch the owner points Claude at is read as data, and the Claude process
+# itself still holds the tokens.
 name: claude
 on:
-  issue_comment: # zizmor: ignore[dangerous-triggers] -- owner-only if:, no PR code checked out or executed; action re-checks write access
+  issue_comment: # zizmor: ignore[dangerous-triggers] -- owner-gated trigger; cross-repo PRs refused by the fork step; no PR code executed (no build/test tools allowlisted); env scrub on
     types: [created]
   pull_request_review_comment:
     types: [created]
@@ -20,12 +26,14 @@ jobs:
       github.actor != 'dependabot[bot]' &&
       github.actor == github.repository_owner && (
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.review.body, '@claude')) ||
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
       )
     runs-on: ${{ vars.CLAUDE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     concurrency:
       group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: false
@@ -36,18 +44,32 @@ jobs:
       actions: read # mcp__github_ci__* tools
       id-token: write # Claude GitHub App token exchange (OIDC)
     steps:
+      - name: Refuse cross-repository pull requests
+        id: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+          IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
+        run: |
+          # Fail closed: any error or unexpected answer means cross=true. Plain issues are never cross-repo.
+          cross=true
+          if [ "$IS_PR" != "true" ]; then
+            cross=false
+          elif out=$(gh pr view "$PR" --repo "$REPO" --json isCrossRepository -q .isCrossRepository 2>/dev/null) \
+            && { [ "$out" = "true" ] || [ "$out" = "false" ]; }; then
+            cross="$out"
+          fi
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+          [ "$cross" = "true" ] && echo "::warning::cross-repository or unverifiable PR; Claude was not started"
+          exit 0
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.12"
-      - name: Install test deps
-        run: python3 -m pip install --disable-pip-version-check 'pytest==8.3.5' 'pyyaml==6.0.3'
       - name: Run Claude
+        if: steps.fork.outputs.cross != 'true'
         uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -61,6 +83,6 @@ jobs:
             --permission-mode auto
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
             --max-turns 40
-            --allowedTools "Bash(python3 -m pytest:*),Bash(python3 -I probes.py mcp_reference_monitor.py),Bash(python3 -I lifecycle/gem_lifecycle.py dryrun),Bash(python3 -I gemctl.py scan-diff:*),Bash(python3 -I gemctl.py debt:*),Bash(python3 -I gemctl.py version),Bash(git status),Bash(git diff:*),Bash(git log:*)"
-            --disallowedTools "WebFetch,WebSearch,Bash(python3 -I gemctl.py gate:*),Bash(python3 -I gemctl.py heavy:*),Bash(python3 -I gemctl.py trailer:*),Bash(python3 install_hooks.py:*),Bash(sudo:*),Bash(bash lifecycle/deploy_awsbox.sh:*),Bash(./lifecycle/deploy_awsbox.sh:*),Bash(bash ci/apply_rulesets.sh:*),Bash(gh api:*),Bash(git push origin main*),Bash(git push --force*)"
-            --append-system-prompt "CI context: GitHub Actions, no ForgeCore, no gem hooks, no B200. Never run gemctl gate/heavy/trailer, never edit .github/workflows/gem-review.yml or ci/gem-review.yml (they must stay byte-identical), never touch ci/rulesets/main.json. Branches are fix/<issue>-<slug>. Before finishing run python3 -m pytest -q, python3 -I probes.py mcp_reference_monitor.py and python3 -I lifecycle/gem_lifecycle.py dryrun and quote their summary lines."
+            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(python3 -I gemctl.py gate:*),Bash(python3 -I gemctl.py heavy:*),Bash(python3 -I gemctl.py trailer:*),Bash(python3 install_hooks.py:*),Bash(sudo:*),Bash(bash lifecycle/deploy_awsbox.sh:*),Bash(./lifecycle/deploy_awsbox.sh:*),Bash(bash ci/apply_rulesets.sh:*),Bash(gh api:*),Bash(git push origin main*),Bash(git push --force*)"
+            --append-system-prompt "CI context: GitHub Actions, no ForgeCore, no gem hooks, no B200. You cannot run tests, scripts or package managers here: CI runs automatically on your pushes (without secrets) and reports results. Never run gemctl gate/heavy/trailer, never edit .github/workflows/gem-review.yml or ci/gem-review.yml (they must stay byte-identical), never touch ci/rulesets/main.json. Branches are fix/<issue>-<slug>."

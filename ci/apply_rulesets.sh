@@ -5,7 +5,9 @@
 #
 # Run it as the repo owner with the GitHub CLI logged in (`gh auth login`; Termux: `pkg install gh`).
 # Rulesets on a PRIVATE repo are enforced only on GitHub Pro/Team/Enterprise; on the Free plan they are
-# enforced on public repos only. No GitHub CLI? Settings → Rules → Rulesets → New ruleset → Import a ruleset,
+# enforced on public repos only.
+# A ruleset with "enforcement": "disabled" (agent-approval.json ships that way) is created/updated as
+# disabled and enforces nothing; flip it to "active" only after a green agent-approval-check run, then re-run. No GitHub CLI? Settings → Rules → Rulesets → New ruleset → Import a ruleset,
 # and pick each JSON file.
 set -euo pipefail
 REPO="${1:-asshat1981ar/GitHubOpsGem}"
@@ -14,6 +16,8 @@ command -v gh >/dev/null || { echo "install the GitHub CLI first (Termux: pkg in
 for f in "$HERE"/rulesets/*.json; do
   name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$f")"
   id="$(gh api "repos/$REPO/rulesets" --jq ".[] | select(.name == \"$name\") | .id" | head -1)"
+  enf="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforcement","active"))' "$f")"
+  echo "ruleset: $name (enforcement: $enf)"
   if [[ -n "$id" ]]; then
     gh api -X PUT "repos/$REPO/rulesets/$id" --input "$f" --jq '"updated: \(.name) (id \(.id), \(.enforcement))"'
   else

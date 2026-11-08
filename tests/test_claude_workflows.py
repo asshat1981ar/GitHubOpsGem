@@ -1,4 +1,5 @@
 """Hardening policy for the Claude Code Action workflows, expressed as tests."""
+import json
 import re
 import shutil
 import subprocess
@@ -129,3 +130,80 @@ def test_verdict_has_deterministic_fallback():
     assert "!cancelled()" in str(last["if"])
     assert "WARN" in last["run"]
     assert any(s.get("continue-on-error") for s in claude_steps(job))
+
+
+# ---- Santa round 1 hardening (F1-F6) ----
+BUILD_TOOL = re.compile(r"python3?|pytest|pip|gradle|npm|pnpm|yarn|cargo|make|godot|probes|lifecycle|gemctl|actionlint|zizmor")
+
+
+def _allowed(step):
+    m = re.search(r'--allowedTools "([^"]*)"', step["with"]["claude_args"])
+    assert m, "no --allowedTools"
+    return [t.strip() for t in re.split(r",(?![^()]*\))", m.group(1))]
+
+
+def test_claude_yml_fork_guard_step():
+    job = load(WF_DIR / "claude.yml")["jobs"]["claude"]
+    steps = job["steps"]
+    fork = steps[0]
+    assert fork.get("id") == "fork"
+    assert "isCrossRepository" in fork["run"]
+    assert "${{" not in fork["run"]
+    assert fork["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "PR" in fork["env"] and "REPO" in fork["env"]
+    assert "cross=true" in fork["run"]  # fails closed
+    (claude,) = claude_steps(job)
+    assert claude["if"] == "steps.fork.outputs.cross != 'true'"
+    assert steps.index(fork) < steps.index(claude)
+    cond = str(job["if"])
+    for ev in ("pull_request_review_comment", "pull_request_review"):
+        line = next(ln for ln in cond.splitlines() if f"'{ev}'" in ln)
+        assert "github.event.pull_request.head.repo.full_name == github.repository" in line, ev
+
+
+@pytest.mark.parametrize("path", FILES, ids=lambda p: p.name)
+def test_claude_jobs_scrub_env(path):
+    for name, job in load(path)["jobs"].items():
+        if claude_steps(job):
+            assert str(job.get("env", {}).get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")) == "1", name
+
+
+def test_claude_yml_allows_no_build_tools():
+    (claude,) = claude_steps(load(WF_DIR / "claude.yml")["jobs"]["claude"])
+    tools = _allowed(claude)
+    assert tools
+    for t in tools:
+        assert t.startswith(("Bash(git diff", "Bash(git log", "Bash(git status", "Bash(git show",
+                             "Bash(gh pr view", "Bash(gh pr diff", "Bash(gh issue view")), t
+        assert not BUILD_TOOL.search(t[len('Bash('):]), t
+
+
+@pytest.mark.parametrize("path", [WF_DIR / "claude-review.yml", WF_DIR / "claude-gem-verdict.yml"], ids=lambda p: p.name)
+def test_agent_mode_jobs_do_not_read_comments(path):
+    text = path.read_text(encoding="utf-8")
+    assert "include_comments_by_actor" not in text
+    assert "gh api" not in text and "--comments" not in text
+    for job in load(path)["jobs"].values():
+        for s in claude_steps(job):
+            tools = _allowed(s)
+            assert "Bash(gh pr view:*)" not in tools
+            assert not any(t.startswith("Bash(gh api") or t.startswith("Bash(gh pr comment") for t in tools)
+
+
+def test_settings_json_allow_has_no_bash():
+    perms = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]
+    assert not any(a.startswith("Bash(") for a in perms["allow"])
+    assert "Read(./.env*)" in perms["deny"] and "Read(./.git/config)" in perms["deny"]
+
+
+def test_agent_approval_ruleset_ships_disabled():
+    rs = json.loads((ROOT / "ci" / "rulesets" / "agent-approval.json").read_text(encoding="utf-8"))
+    assert rs["enforcement"] == "disabled"
+    script = (ROOT / "ci" / "apply_rulesets.sh").read_text(encoding="utf-8")
+    assert "enforcement" in script and "disabled" in script
+
+
+def test_verdict_uses_deterministic_count():
+    run = load(WF_DIR / "claude-gem-verdict.yml")["jobs"]["verdict"]["steps"][-1]["run"]
+    assert "totals.critical" in run and "no Claude verdict" in run
+    assert "actor.login != 'dependabot[bot]'" in str(load(WF_DIR / "claude-gem-verdict.yml")["jobs"]["verdict"]["if"])
