@@ -83,7 +83,9 @@ litellm_settings:
   budget_duration: 1d
   # WU-07: ds-burst traffic keeps the B200 awake; ds-main 429 storms wake it. File sits next to this config.
   # Needs GEM_LIFECYCLE_TOKEN (and optionally GEM_LIFECYCLE_URL) in LiteLLM's environment.
-  callbacks: gem_lifecycle_callback.proxy_handler_instance
+  # WU-05: gem_guardrail strips <think>...</think> from streamed and non-streamed output (/chat/completions and
+  # /v1/messages). Sits next to this config with mcp_reference_monitor.py beside it (or in $GEM_HOME/lib).
+  callbacks: [gem_lifecycle_callback.proxy_handler_instance, gem_guardrail.proxy_handler_instance]
   # guardrails: enable after WU-05 (gem_guardrail.py) ships and passes conformance
   # guardrails:
   #   - guardrail_name: gem-protocol
