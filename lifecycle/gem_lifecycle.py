@@ -18,6 +18,12 @@ Policy (decisions of 2026-11-07):
     rolls over. Periods follow GEM_CAP_TZ (default America/Chicago); weeks start on Monday.
   * Guard: wakes stay disabled while unused auto-delete is not verifiably off, while the deployment is
     deleting, expiring or failed, or while min replicas is above zero. Sleep and caps keep working.
+  * Restarts: the ledger, the last replica count, in-flight requests and sessions are persisted (fsynced). The
+    first look after a restart bills the whole unobserved gap at the larger of the saved and current replica
+    count. An unreadable ledger refuses wakes until the next weekly rollover instead of restarting at $0.
+  * Clocks: accrual inside a process uses the monotonic clock; a wall-clock step moves every timer with it.
+  * API roles: GEM_LIFECYCLE_TOKEN (operator, everything), GEM_LIFECYCLE_FEED_TOKEN (LiteLLM callback: /touch,
+    /signal/429), GEM_LIFECYCLE_SESSION_TOKEN (Claude Code hooks: /session/*, GET /status).
 """
 
 from __future__ import annotations
@@ -29,12 +35,14 @@ import datetime as dt
 import hmac
 import io
 import json
+import math
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -47,10 +55,26 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.9
     ZoneInfo = None  # type: ignore[assignment]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 API_BASE = "https://api.fireworks.ai"
 DEPLOYMENT_RE = re.compile(r"^accounts/[\w.-]+/deployments/[\w.-]+$")
 _DUR_PART = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
+CLOCK_STEP_S = 5.0          # wall and monotonic deltas further apart than this are a clock step
+LOOP_SLACK_S = 60.0         # most a slow loop iteration adds to poll_s (GET, scale and recheck timeouts, firectl)
+MAX_TRACKED = 1000          # sessions and in-flight requests each; more get 429
+ENDED_KEEP = 512            # recently ended call ids remembered (each for 2 x the request lease)
+MAX_DELAY_S = 86400.0
+ROUTE_ROLES: Dict[Tuple[str, str], Tuple[str, ...]] = {
+    ("GET", "/status"): ("operator", "session"),
+    ("POST", "/wake"): ("operator",),
+    ("POST", "/sleep"): ("operator",),
+    ("POST", "/heavy"): ("operator",),
+    ("POST", "/check"): ("operator",),
+    ("POST", "/session/start"): ("operator", "session"),
+    ("POST", "/session/end"): ("operator", "session"),
+    ("POST", "/touch"): ("operator", "feed"),
+    ("POST", "/signal/429"): ("operator", "feed"),
+}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -75,12 +99,33 @@ def parse_duration(value: Any) -> Optional[float]:
 
 
 def _tz(name: str):
-    if ZoneInfo is None:
+    if name.upper() == "UTC" or ZoneInfo is None:
         return dt.timezone.utc
     try:
         return ZoneInfo(name)
-    except Exception:  # noqa: BLE001 - unknown zone or no tzdata
+    except Exception:  # noqa: BLE001 - unknown zone or no tzdata; validate() refuses to serve with it
         return dt.timezone.utc
+
+
+if hasattr(time, "CLOCK_BOOTTIME"):
+    def boottime() -> float:
+        """Monotonic (immune to wall-clock steps) but, unlike CLOCK_MONOTONIC, it keeps counting while the host
+        is suspended, and so does Fireworks' meter."""
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+else:  # pragma: no cover - not Linux
+    boottime = time.monotonic
+
+
+def tz_known(name: str) -> bool:
+    if name.upper() == "UTC":
+        return True
+    if ZoneInfo is None or not name:
+        return False
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def period_keys(ts: float, tzname: str) -> Tuple[str, str]:
@@ -98,7 +143,7 @@ def next_rollover(ts: float, tzname: str, period: str) -> float:
 
 
 def iso(ts: Optional[float]) -> Optional[str]:
-    if ts is None:
+    if ts is None or not math.isfinite(ts):
         return None
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -124,9 +169,24 @@ def find_autodelete(obj: Any) -> Tuple[bool, Any]:
 
 # --------------------------------------------------------------------------- config
 
-def _float(env: Dict[str, str], key: str, default: float) -> float:
-    raw = env.get(key)
-    return float(raw) if raw not in (None, "") else default
+def _plain(raw: Optional[str]) -> str:
+    """systemd's EnvironmentFile= keeps an inline "# comment" in the value; numbers and zone names never hold '#'."""
+    return (raw or "").split("#", 1)[0].strip()
+
+
+def _float(env: Dict[str, str], key: str, default: float, errors: List[str]) -> float:
+    raw = _plain(env.get(key))
+    if raw == "":
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        errors.append(f"{key} must be a number (got {env.get(key)!r})")
+        return default
+    if not math.isfinite(val):
+        errors.append(f"{key} must be a finite number")
+        return default
+    return val
 
 
 @dataclasses.dataclass
@@ -143,60 +203,84 @@ class Config:
     wake_timeout_s: float = 900.0           # give up on a cold start that never becomes ready
     storm_count: int = 3                    # ds-main 429s ...
     storm_window_s: float = 120.0           # ... within this window wake the B200
-    request_lease_s: float = 900.0          # an in-flight request older than this is treated as finished
+    request_lease_s: float = 660.0          # an in-flight request older than this is treated as finished
     session_ttl_s: float = 12 * 3600.0
-    max_gap_s: float = 3600.0               # longest unobserved stretch billed after a restart
     recheck_s: float = 3600.0
     default_gpus: int = 4
     tz: str = "America/Chicago"
     bind: str = "127.0.0.1:8090"
-    token: str = ""
+    token: str = ""                         # operator: every endpoint
+    feed_token: str = ""                    # LiteLLM callback: /touch, /signal/429
+    session_token: str = ""                 # Claude Code hooks: /session/start, /session/end, GET /status
     state_path: Optional[str] = None
     autodelete_verified: bool = False
     autodelete_accept_risk: bool = False
     dry: bool = False
     api_base: str = API_BASE
+    env_errors: List[str] = dataclasses.field(default_factory=list, repr=False)
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Config":
         e = dict(os.environ if env is None else env)
+        errors: List[str] = []
         dep = (e.get("GEM_BURST_DEPLOYMENT") or e.get("GEM_BURST_MODEL") or "").strip()
         dep = re.sub(r"^(openai|fireworks_ai)/", "", dep)
         home = os.path.expanduser(e.get("GEM_HOME", "~/.gem"))
         return cls(
             deployment=dep,
             api_key=e.get("FIREWORKS_API_KEY", ""),
-            gpu_rate_usd_per_hour=_float(e, "GEM_GPU_RATE_USD_PER_HOUR", 13.0),
-            cap_day_usd=_float(e, "GEM_GPU_CAP_DAY_USD", 26.0),
-            cap_week_usd=_float(e, "GEM_GPU_CAP_WEEK_USD", 78.0),
-            idle_sleep_s=_float(e, "GEM_IDLE_SLEEP_S", 180.0),
-            session_end_sleep_s=_float(e, "GEM_SESSION_END_SLEEP_S", 45.0),
-            poll_s=_float(e, "GEM_POLL_S", 15.0),
-            wake_reserve_s=_float(e, "GEM_WAKE_RESERVE_S", 300.0),
-            storm_count=int(_float(e, "GEM_429_WAKE_COUNT", 3)),
-            storm_window_s=_float(e, "GEM_429_WINDOW_S", 120.0),
-            default_gpus=int(_float(e, "GEM_GPUS_PER_REPLICA", 4)),
-            tz=e.get("GEM_CAP_TZ", "America/Chicago"),
+            gpu_rate_usd_per_hour=_float(e, "GEM_GPU_RATE_USD_PER_HOUR", 13.0, errors),
+            cap_day_usd=_float(e, "GEM_GPU_CAP_DAY_USD", 26.0, errors),
+            cap_week_usd=_float(e, "GEM_GPU_CAP_WEEK_USD", 78.0, errors),
+            idle_sleep_s=_float(e, "GEM_IDLE_SLEEP_S", 180.0, errors),
+            session_end_sleep_s=_float(e, "GEM_SESSION_END_SLEEP_S", 45.0, errors),
+            poll_s=_float(e, "GEM_POLL_S", 15.0, errors),
+            wake_reserve_s=_float(e, "GEM_WAKE_RESERVE_S", 300.0, errors),
+            storm_count=int(_float(e, "GEM_429_WAKE_COUNT", 3, errors)),
+            storm_window_s=_float(e, "GEM_429_WINDOW_S", 120.0, errors),
+            request_lease_s=_float(e, "GEM_REQUEST_LEASE_S", 660.0, errors),
+            default_gpus=int(_float(e, "GEM_GPUS_PER_REPLICA", 4, errors)),
+            tz=_plain(e.get("GEM_CAP_TZ")) or "America/Chicago",
             bind=e.get("GEM_LIFECYCLE_BIND", "127.0.0.1:8090"),
             token=e.get("GEM_LIFECYCLE_TOKEN", ""),
+            feed_token=e.get("GEM_LIFECYCLE_FEED_TOKEN", ""),
+            session_token=e.get("GEM_LIFECYCLE_SESSION_TOKEN", ""),
             state_path=e.get("GEM_LIFECYCLE_STATE") or os.path.join(home, "lifecycle.json"),
             autodelete_verified=e.get("GEM_AUTODELETE_VERIFIED", "") == "1",
             autodelete_accept_risk=e.get("GEM_AUTODELETE_ACCEPT_RISK", "") == "1",
             dry=e.get("GEM_LIFECYCLE_DRY", "") == "1",
             api_base=(e.get("GEM_FIREWORKS_API_BASE") or API_BASE).rstrip("/"),
+            env_errors=errors,
         )
 
+    def role_tokens(self) -> Dict[str, str]:
+        return {"operator": self.token, "feed": self.feed_token, "session": self.session_token}
+
     def validate(self) -> List[str]:
-        errs = []
+        errs = list(self.env_errors)
         if not DEPLOYMENT_RE.match(self.deployment):
             errs.append("GEM_BURST_DEPLOYMENT must look like accounts/<acct>/deployments/<id>")
-        for name in ("cap_day_usd", "cap_week_usd", "gpu_rate_usd_per_hour", "poll_s", "idle_sleep_s"):
+        for name in ("cap_day_usd", "cap_week_usd", "gpu_rate_usd_per_hour", "poll_s", "idle_sleep_s",
+                     "request_lease_s"):
             if getattr(self, name) <= 0:
                 errs.append(f"{name} must be positive")
         if self.cap_week_usd < self.cap_day_usd:
             errs.append("weekly cap is below the daily cap")
+        if not tz_known(self.tz):
+            errs.append(f"GEM_CAP_TZ={self.tz!r} is not a known time zone (install tzdata, or set UTC)")
         if self.api_base != API_BASE and not re.match(r"^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$", self.api_base):
             errs.append("GEM_FIREWORKS_API_BASE may only point at a loopback test server (the API key goes there)")
+        names = {"operator": "GEM_LIFECYCLE_TOKEN", "feed": "GEM_LIFECYCLE_FEED_TOKEN",
+                 "session": "GEM_LIFECYCLE_SESSION_TOKEN"}
+        seen: Dict[str, str] = {}
+        for role, tok in self.role_tokens().items():
+            if not tok:
+                continue
+            if len(tok) < 16 or re.search(r"[\s#]", tok):
+                errs.append(f"{names[role]} must be at least 16 characters with no whitespace or '#'")
+            if tok in seen:
+                errs.append(f"{names[role]} must differ from {names[seen[tok]]} (each role gets its own token)")
+            seen.setdefault(tok, role)
         return errs
 
 
@@ -373,16 +457,44 @@ def firectl_get(deployment: str, timeout: float = 20.0) -> Optional[dict]:
 
 # --------------------------------------------------------------------------- controller
 
+def _opt_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError(f"non-finite timestamp {v!r}")
+    return f
+
+
+def _recent(d: Any, now: float, ttl: float) -> Dict[str, float]:
+    """Persisted {id: timestamp} entries still inside their TTL, newest MAX_TRACKED kept."""
+    if d is None:
+        return {}
+    if not isinstance(d, dict):
+        raise ValueError("expected an object of timestamps")
+    live = sorted(((str(k), float(v)) for k, v in d.items()), key=lambda kv: kv[1])
+    return dict([kv for kv in live if now - kv[1] <= ttl][-MAX_TRACKED:])
+
+
 class Lifecycle:
-    """All policy lives here. Thread-safe; the HTTP layer and the poll loop both call into it."""
+    """All policy lives here. Thread-safe; the HTTP layer and the poll loop both call into it.
+
+    `clock` is the wall clock (cap periods, persisted timestamps). `mono` measures elapsed time inside this
+    process: by default boottime() for the real clock; a simulated wall clock brings its own as `clock.mono`.
+    """
 
     def __init__(self, cfg: Config, client: Any, clock: Callable[[], float] = time.time,
-                 out: Optional[io.TextIOBase] = None, firectl: Callable[[str], Optional[dict]] = firectl_get):
-        self.cfg, self.client, self.clock, self.out, self.firectl = cfg, client, clock, out, firectl
-        self.lock = threading.RLock()
+                 out: Optional[io.TextIOBase] = None, firectl: Callable[[str], Optional[dict]] = firectl_get,
+                 mono: Optional[Callable[[], float]] = None):
+        if mono is None:                                 # a custom clock without .mono: no step detection
+            mono = boottime if clock is time.time else getattr(clock, "mono", clock)
+        self.cfg, self.client, self.clock, self.mono = cfg, client, clock, mono
+        self.out, self.firectl = out, firectl
+        self.lock = threading.RLock()                    # state; never held across network I/O
+        self._tick_guard = threading.Lock()              # one observe-decide-act cycle at a time
         self.snapshot: Optional[Snapshot] = None
         self.gpu_seconds: Dict[str, float] = {}
-        self.last_tick: Optional[float] = None
+        self.last_tick: Optional[float] = None           # wall time of the last accrual (persisted)
         self.last_traffic: Optional[float] = None
         self.ready_since: Optional[float] = None
         self.wake_at: Optional[float] = None
@@ -394,17 +506,47 @@ class Lifecycle:
         self.sleep_requested_at: Optional[float] = None
         self.sessions: Dict[str, float] = {}
         self.inflight: Dict[str, float] = {}
+        self.ended: "collections.OrderedDict[str, float]" = collections.OrderedDict()   # call id -> ended at
         self.storm: Deque[float] = collections.deque()
         self.capped: Optional[str] = None
+        self.ledger_lost_until: Optional[float] = None   # set when the persisted ledger could not be read
         self.wake_disabled: Optional[str] = "startup checks have not run"
         self.report: Optional[CheckReport] = None
         self.api_errors = 0
-        self.unmetered_gap_s = 0.0
+        self.loop_period_s: Optional[float] = None       # last measured interval between ticks (monotonic)
+        self.saved_replicas = 0                          # what the previous process last saw (replicas or desired)
+        self.saved_gpus = 0
         self.events: Deque[dict] = collections.deque(maxlen=100)
         self.scale_calls: List[Tuple[float, int, str]] = []
         self._first_accrual = True                       # first look since this process started
         self._resume_reason: Optional[str] = None        # wake intent persisted by a previous process
+        self._ref: Optional[Tuple[float, float]] = None  # (wall, mono) at the last clock read
+        self._tick_mono: Optional[float] = None          # mono at the last accrual
         self._load()
+
+    # ---- clocks
+    def _now(self) -> float:
+        """Wall time, after moving every timer along with any wall-clock step since the last read."""
+        wall, mono = self.clock(), self.mono()
+        if self._ref is not None:
+            step = (wall - self._ref[0]) - (mono - self._ref[1])
+            if abs(step) > CLOCK_STEP_S:
+                self._shift(step)
+                self._log("clock_step", step_s=round(step, 1),
+                          note="wall clock stepped; timers moved with it, metering uses the monotonic clock")
+        self._ref = (wall, mono)
+        return wall
+
+    def _shift(self, step: float) -> None:
+        for name in ("last_tick", "last_traffic", "ready_since", "wake_at", "sleep_at", "sleep_requested_at",
+                     "last_down_at"):
+            val = getattr(self, name)
+            if val is not None:
+                setattr(self, name, val + step)
+        for table in (self.inflight, self.sessions, self.ended):
+            for key in table:
+                table[key] += step
+        self.storm = collections.deque(t + step for t in self.storm)
 
     # ---- logging and persistence
     def _log(self, event: str, **fields: Any) -> None:
@@ -419,24 +561,41 @@ class Lifecycle:
 
     def _load(self) -> None:
         path = self.cfg.state_path
-        if not path or not os.path.exists(path):
+        if not path or not os.path.exists(path):         # first install: nothing has been metered yet
             return
+        now = self.clock()
         try:
             with open(path, encoding="utf-8") as fh:
-                st = json.load(fh)
-            self.gpu_seconds = {str(k): float(v) for k, v in (st.get("gpu_seconds") or {}).items()}
-            self.last_tick = st.get("last_tick")
-            self.last_traffic = st.get("last_traffic")
-            self.heavy = bool(st.get("heavy"))
-            self._resume_reason = st.get("wake_reason") or ("heavy" if self.heavy else None)
+                raw = fh.read()
+            if not raw.strip():
+                raise ValueError("state file is empty")
+            st = json.loads(raw)
+            if not isinstance(st, dict) or not isinstance(st.get("gpu_seconds"), dict):
+                raise ValueError("state file has no spend ledger")
+            gpu_seconds = {str(k): float(v) for k, v in st["gpu_seconds"].items()}
+            last_tick, last_traffic = _opt_float(st.get("last_tick")), _opt_float(st.get("last_traffic"))
+            lost_until = _opt_float(st.get("ledger_lost_until"))
+            replicas = max(int(st.get("replicas") or 0), int(st.get("desired") or 0))
+            gpus = int(st.get("gpus") or 0)
+            inflight = _recent(st.get("inflight"), now, self.cfg.request_lease_s)
+            sessions = _recent(st.get("sessions"), now, self.cfg.session_ttl_s)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
-            aside = f"{path}.corrupt-{int(time.time())}"
+            aside: Optional[str] = f"{path}.corrupt-{int(now)}"
             try:
-                os.replace(path, aside)
+                os.replace(path, aside)  # type: ignore[arg-type]
             except OSError:
-                pass
-            self._log("state_unreadable", detail=str(exc), moved_to=aside,
-                      note="spend ledger restarted at zero; check Fireworks billing for today")
+                aside = None
+            self.ledger_lost_until = next_rollover(now, self.cfg.tz, "week")
+            self._log("state_unreadable", severity="CRITICAL", detail=str(exc), moved_to=aside,
+                      ledger_lost_until=iso(self.ledger_lost_until),
+                      note="spend ledger lost: wakes are refused until the weekly rollover; check Fireworks billing")
+            self._save()
+            return
+        self.gpu_seconds, self.last_tick, self.last_traffic = gpu_seconds, last_tick, last_traffic
+        self.heavy = bool(st.get("heavy"))
+        self._resume_reason = st.get("wake_reason") or ("heavy" if self.heavy else None)
+        self.saved_replicas, self.saved_gpus, self.ledger_lost_until = replicas, gpus, lost_until
+        self.inflight, self.sessions = inflight, sessions
 
     def _save(self) -> None:
         path = self.cfg.state_path
@@ -447,14 +606,27 @@ class Lifecycle:
         for back in range(0, 22):
             keep.update(period_keys(now - back * 86400, self.cfg.tz))
         self.gpu_seconds = {k: v for k, v in self.gpu_seconds.items() if k in keep}
-        st = {"version": 1, "gpu_seconds": self.gpu_seconds, "last_tick": self.last_tick,
-              "last_traffic": self.last_traffic, "heavy": self.heavy, "wake_reason": self.wake_reason}
+        snap = self.snapshot
+        st = {"version": 2, "gpu_seconds": self.gpu_seconds, "last_tick": self.last_tick,
+              "last_traffic": self.last_traffic, "heavy": self.heavy,
+              "wake_reason": self.wake_reason or self._resume_reason,
+              "replicas": snap.replicas if snap else self.saved_replicas, "desired": snap.desired if snap else 0,
+              "gpus": snap.gpus if snap else self.saved_gpus,
+              "inflight": self.inflight, "sessions": self.sessions, "ledger_lost_until": self.ledger_lost_until}
+        folder = os.path.dirname(os.path.abspath(path))
+        tmp = f"{path}.tmp"
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            tmp = f"{path}.tmp"
+            os.makedirs(folder, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(st, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())                    # data on disk before the rename publishes it
             os.replace(tmp, path)
+            dfd = os.open(folder, os.O_RDONLY)
+            try:
+                os.fsync(dfd)                            # and the rename itself survives a crash
+            finally:
+                os.close(dfd)
         except OSError as exc:
             self._log("state_write_failed", detail=str(exc))
 
@@ -470,50 +642,90 @@ class Lifecycle:
         rate = self.cfg.gpu_rate_usd_per_hour / 3600.0
         return self.gpu_seconds.get(day, 0.0) * rate, self.gpu_seconds.get(week, 0.0) * rate
 
+    def _ledger_lost(self, now: float) -> bool:
+        if self.ledger_lost_until is None:
+            return False
+        if now < self.ledger_lost_until:
+            return True
+        self._log("ledger_restored", note="weekly rollover passed; the caps meter this week's spend again")
+        self.ledger_lost_until = None
+        return False
+
     def headroom(self, now: float) -> Tuple[float, str]:
+        if self._ledger_lost(now):
+            return 0.0, "ledger"
         day, week = self.spend(now)
         d_left, w_left = self.cfg.cap_day_usd - day, self.cfg.cap_week_usd - week
         return (d_left, "day") if d_left <= w_left else (w_left, "week")
 
+    def _resets_at(self, now: float, period: str) -> Optional[str]:
+        if period == "ledger":
+            return iso(self.ledger_lost_until)
+        return iso(next_rollover(now, self.cfg.tz, period))
+
     def _cap_hit(self, now: float) -> Optional[str]:
         left, period = self.headroom(now)
+        if period == "ledger":
+            return period
         replicas = max(1, self.snapshot.replicas if self.snapshot else 1)
-        # Two poll intervals: the one until the next tick, plus the one the deployment bills while draining.
-        margin = 2 * self.cfg.poll_s * replicas * self._usd_per_replica_s()
+        # Two loop periods: the one until the next tick, plus the one the deployment bills while draining. The
+        # period is measured, so a loop slowed down by API timeouts gets a wider margin; a longer gap (host
+        # suspend, a simulated jump) says nothing about the next tick, so it is bounded.
+        measured = min(self.loop_period_s or 0.0, self.cfg.poll_s + LOOP_SLACK_S)
+        period_s = max(self.cfg.poll_s, measured)
+        margin = 2 * period_s * replicas * self._usd_per_replica_s()
         return period if left <= margin else None
 
     def _accrue(self, now: float, prev: Optional[Snapshot], cur: Optional[Snapshot]) -> None:
+        mono = self._ref[1] if self._ref is not None else self.mono()
         first, self._first_accrual = self._first_accrual, False
-        if self.last_tick is None:
-            self.last_tick = now
-            return
-        gap = max(0.0, now - self.last_tick)
-        self.last_tick = now
-        replicas = max(prev.replicas if prev else 0, cur.replicas if cur else 0)
+        last_mono, self._tick_mono = self._tick_mono, mono
+        last_wall, self.last_tick = self.last_tick, now
+        seen = [s for s in (prev, cur) if s is not None]
+        if first:
+            if last_wall is None:                        # first start ever: nothing to bill yet
+                return
+            gap = max(0.0, now - last_wall)              # wall time no process was watching: bill all of it
+            replicas = max([self.saved_replicas] + [s.replicas for s in seen])
+            gpus = max([self.saved_gpus] + [s.gpus for s in seen]) or self.cfg.default_gpus
+            self._log("restart_gap_billed", seconds=round(gap), replicas=replicas, gpus=gpus,
+                      usd=round(gap * replicas * gpus * self.cfg.gpu_rate_usd_per_hour / 3600.0, 2))
+        else:
+            gap = max(0.0, mono - last_mono) if last_mono is not None else 0.0
+            self.loop_period_s = gap
+            replicas = max([0] + [s.replicas for s in seen])
+            gpus = (cur or prev).gpus if seen else self.cfg.default_gpus  # type: ignore[union-attr]
         if replicas == 0 or gap == 0.0:
             return
-        if first and gap > self.cfg.max_gap_s:              # first look after a restart, GPU already up
-            self.unmetered_gap_s += gap - self.cfg.max_gap_s
-            self._log("unmetered_gap", seconds=round(gap - self.cfg.max_gap_s),
-                      note="controller was down while the GPU was up; billed max_gap_s, reconcile with Fireworks")
-            gap = self.cfg.max_gap_s
-        gpus = (cur or prev).gpus  # type: ignore[union-attr]
         for key in period_keys(now, self.cfg.tz):
             self.gpu_seconds[key] = self.gpu_seconds.get(key, 0.0) + gap * replicas * gpus
 
     # ---- actions on Fireworks
-    def _scale(self, now: float, replicas: int, reason: str) -> bool:
+    #
+    # Locking: `self.lock` guards controller state and is never held across network I/O, so /touch, /session/*
+    # and /status always answer at once. `_tick_guard` (not reentrant) serializes the observe-decide-act cycles
+    # (tick, wake, sleep now, recheck): it is held across the Fireworks GET and PATCH, so two cycles never
+    # interleave and a decision can't be made twice before its scale call is recorded. Order: _tick_guard first,
+    # then self.lock; never take _tick_guard while holding self.lock.
+
+    def _send_scale(self, replicas: int) -> Optional[str]:
+        """The Fireworks call alone. Caller holds _tick_guard and not self.lock. Returns an error or None."""
+        if self.cfg.dry:
+            return None
         try:
-            if self.cfg.dry:
-                self._log("scale_dry_run", replicas=replicas, reason=reason)
-            else:
-                self.client.scale(replicas)
-                self._log("scale", replicas=replicas, reason=reason)
+            self.client.scale(replicas)
         except FireworksError as exc:
-            self._log("scale_error", replicas=replicas, reason=reason, detail=str(exc))
+            return str(exc)
+        return None
+
+    def _record_scale(self, now: float, replicas: int, reason: str, err: Optional[str]) -> bool:
+        """Caller holds self.lock."""
+        if err is not None:
+            self._log("scale_error", replicas=replicas, reason=reason, detail=err)
             return False
+        self._log("scale_dry_run" if self.cfg.dry else "scale", replicas=replicas, reason=reason)
         self.scale_calls.append((now, replicas, reason))
-        if self.snapshot is not None:
+        if self.snapshot is not None and not self.cfg.dry:   # DRY changed nothing: keep reporting what is there
             self.snapshot = dataclasses.replace(self.snapshot, desired=replicas)
         if replicas == 0:
             self.last_down_at = now
@@ -522,27 +734,47 @@ class Lifecycle:
             self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
         return True
 
-    def _down(self, now: float, snap: Snapshot, reason: str) -> None:
+    def _act(self, now: float, action: Tuple[int, str]) -> Optional[str]:
+        """Carry out a scale decided under self.lock, then record it. Caller holds _tick_guard only."""
+        replicas, reason = action
+        err = self._send_scale(replicas)
+        with self.lock:
+            self._record_scale(now, replicas, reason, err)
+            self._save()
+        return err
+
+    def _down(self, now: float, snap: Snapshot, reason: str) -> Optional[Tuple[int, str]]:
+        """The scale-down to send, if one is needed. Caller holds self.lock."""
         stale = self.last_down_at is None or now - self.last_down_at > 120
         if snap.desired > 0 or (snap.replicas > 0 and stale):
-            self._scale(now, 0, reason)
-        else:  # already draining; clear intents so nothing re-fires
-            self.heavy = False
-            self.wake_at = self.wake_reason = None
-            self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
+            return 0, reason
+        self.heavy = False                               # already draining; clear intents so nothing re-fires
+        self.wake_at = self.wake_reason = None
+        self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
+        return None
 
     # ---- the loop body
     def tick(self) -> None:
+        with self._tick_guard:
+            self._tick()
+
+    def _tick(self) -> None:
+        """One observe-decide-act cycle. Caller holds _tick_guard and not self.lock."""
+        try:
+            doc: Optional[dict] = self.client.get()
+            err: Optional[FireworksError] = None
+        except FireworksError as exc:
+            doc, err = None, exc
         with self.lock:
-            now = self.clock()
+            now = self._now()                            # taken once the GET has returned
             prev = self.snapshot
-            try:
-                cur: Optional[Snapshot] = Snapshot.from_api(self.client.get(), self.cfg.default_gpus)
+            if err is None:
+                cur: Optional[Snapshot] = Snapshot.from_api(doc or {}, self.cfg.default_gpus)
                 self.api_errors = 0
-            except FireworksError as exc:
+            else:
                 self.api_errors += 1
-                self._log("api_error", detail=str(exc), consecutive=self.api_errors)
-                cur = prev                                   # keep metering on the last known replica count
+                self._log("api_error", detail=str(err), consecutive=self.api_errors)
+                cur = prev                               # keep metering on the last known replica count
             self._accrue(now, prev, cur)
             if cur is None:
                 self._save()
@@ -557,28 +789,32 @@ class Lifecycle:
             if not cur.active:
                 self.heavy = False
                 self.wake_at = self.wake_reason = None
-            self._enforce(now, cur)
+            action = self._enforce(now, cur)
             self._resume_reason = None
             self._save()
+        if action is not None:
+            self._act(now, action)
 
-    def _enforce(self, now: float, snap: Snapshot) -> None:
+    def _enforce(self, now: float, snap: Snapshot) -> Optional[Tuple[int, str]]:
+        """Apply the policy to fresh state; return the scale call to make, if any. Caller holds self.lock."""
         cap = self._cap_hit(now)
         if cap:
             if self.capped != cap:
                 day, week = self.spend(now)
                 self._log("cap_tripped", period=cap, spend_day_usd=round(day, 2), spend_week_usd=round(week, 2),
-                          resets_at=iso(next_rollover(now, self.cfg.tz, cap)))
+                          resets_at=self._resets_at(now, cap))
             self.capped = cap
-            if snap.active:
-                self._down(now, snap, f"cap_{cap}")
-            return
+            return self._down(now, snap, f"cap_{cap}") if snap.active else None
         if self.capped:
             self._log("cap_cleared", period=self.capped)
             self.capped = None
 
         if self.wake_disabled and snap.active and self.wake_at is None:
-            self._down(now, snap, "guard")                   # nobody may wake it while the guard fails
-            return
+            transient = bool(self.report and self.report.info.get("transient"))
+            if not (transient and self._resume_reason):
+                return self._down(now, snap, "guard")    # nobody may wake it while the guard fails
+            # Fireworks didn't answer the startup check: a run that was in progress keeps going (resumed below);
+            # the loop rechecks until it gets an answer, and a hard failure then stops new wakes again.
 
         if self.sleep_at is not None and now >= self.sleep_at:
             reason = self.sleep_reason or "scheduled"
@@ -590,18 +826,15 @@ class Lifecycle:
             else:
                 self.sleep_at = None
                 if snap.active:
-                    self._down(now, snap, reason)
-                    return
+                    return self._down(now, snap, reason)
 
         if snap.desired > 0 and not snap.up and self.wake_at is not None and now - self.wake_at > self.cfg.wake_timeout_s:
             self._log("wake_timeout", waited_s=round(now - self.wake_at))
-            self._down(now, snap, "wake_timeout")
-            return
+            return self._down(now, snap, "wake_timeout")
 
         if snap.up and not self.inflight:
             if now - self._idle_since(now) >= self.cfg.idle_sleep_s:
-                self._down(now, snap, "idle")
-                return
+                return self._down(now, snap, "idle")
 
         if snap.active and self.wake_at is None:
             if self._resume_reason:                          # a run that was in progress when we restarted
@@ -610,133 +843,188 @@ class Lifecycle:
             else:                                            # e.g. a LiteLLM fallback hit the cold B200
                 self._log("unrequested_wake", note="Fireworks autoscaler woke it; only heavy runs and 429 "
                           "storms may wake the B200")
-                self._down(now, snap, "unrequested")
+                return self._down(now, snap, "unrequested")
+        return None
 
     def _idle_since(self, now: float) -> float:
         marks = [t for t in (self.last_traffic, self.ready_since) if t is not None]
         return max(marks) if marks else now
 
     def _expire(self, now: float) -> None:
+        lease = self.cfg.request_lease_s
         for cid, started in list(self.inflight.items()):
-            if now - started > self.cfg.request_lease_s:
+            if now - started > lease:
                 self.inflight.pop(cid, None)
                 self._log("lease_expired", call_id=cid)
         for sid, seen in list(self.sessions.items()):
             if now - seen > self.cfg.session_ttl_s:
                 self.sessions.pop(sid, None)
+        for cid, ended in list(self.ended.items()):
+            if now - ended > 2 * lease:
+                self.ended.pop(cid, None)
         while self.storm and now - self.storm[0] > self.cfg.storm_window_s:
             self.storm.popleft()
 
     # ---- checks
     def recheck(self) -> Tuple[int, dict]:
-        with self.lock:
-            try:
-                doc = self.client.get()
+        with self._tick_guard:
+            try:                                         # network and firectl (up to 20 s) outside self.lock
+                doc: Optional[dict] = self.client.get()
+                err: Optional[FireworksError] = None
             except FireworksError as exc:
-                self.report = CheckReport([f"cannot read the deployment: {exc}"], [], {"transient": True})
-            else:
-                fc = None if find_autodelete(doc)[0] or self.cfg.autodelete_verified else self.firectl(self.cfg.deployment)
-                self.report = check_deployment(doc, self.cfg, fc)
-                if self.snapshot is None:                   # so /status is meaningful before the first tick
-                    self.snapshot = Snapshot.from_api(doc, self.cfg.default_gpus)
-            self.wake_disabled = "; ".join(self.report.hard) or None
-            for msg in self.report.hard:
-                self._log("check_failed", severity="CRITICAL", detail=msg)
-            for msg in self.report.warn:
-                self._log("check_warning", severity="WARNING", detail=msg)
-            if self.report.ok:
-                self._log("check_passed", **self.report.info)
-            return (200 if self.report.ok else 503), self.report.as_dict()
+                doc, err = None, exc
+            fc = None
+            if doc is not None and not (find_autodelete(doc)[0] or self.cfg.autodelete_verified):
+                fc = self.firectl(self.cfg.deployment)
+            with self.lock:
+                self._now()
+                if err is not None or doc is None:
+                    self.report = CheckReport([f"cannot read the deployment: {err}"], [], {"transient": True})
+                else:
+                    self.report = check_deployment(doc, self.cfg, fc)
+                    if self.snapshot is None:               # so /status is meaningful before the first tick
+                        self.snapshot = Snapshot.from_api(doc, self.cfg.default_gpus)
+                self.wake_disabled = "; ".join(self.report.hard) or None
+                for msg in self.report.hard:
+                    self._log("check_failed", severity="CRITICAL", detail=msg)
+                for msg in self.report.warn:
+                    self._log("check_warning", severity="WARNING", detail=msg)
+                if self.report.ok:
+                    self._log("check_passed", **self.report.info)
+                return (200 if self.report.ok else 503), self.report.as_dict()
 
     # ---- requests
-    def wake(self, reason: str) -> Tuple[int, dict]:
-        with self.lock:
-            self.tick()
-            now = self.clock()
-            if self.wake_disabled:
-                self._log("wake_refused", reason=reason, why="guard")
-                return 503, {"ok": False, "refused": "guard", "detail": self.wake_disabled}
-            left, period = self.headroom(now)
-            reserve = self.cfg.wake_reserve_s * self._usd_per_replica_s()
-            if self._cap_hit(now) or left < reserve:
-                resets = iso(next_rollover(now, self.cfg.tz, period))
-                self._log("wake_refused", reason=reason, why=f"cap_{period}", headroom_usd=round(left, 2))
-                return 409, {"ok": False, "refused": f"cap_{period}", "headroom_usd": round(max(left, 0), 2),
-                             "reserve_usd": round(reserve, 2), "resets_at": resets}
-            self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
-            snap = self.snapshot
-            if snap is not None and snap.active:
-                self.wake_at = self.wake_at or now
-                self.wake_reason = self.wake_reason or reason
-                return 200, {"ok": True, "b200": snap.label, "headroom_usd": round(left, 2)}
-            if not self._scale(now, 1, f"wake_{reason}"):
-                return 502, {"ok": False, "refused": "scale_error", "detail": self.events[-1].get("detail")}
-            self.wake_at, self.wake_reason = now, reason
-            return 202, {"ok": True, "b200": "waking", "headroom_usd": round(left, 2),
-                         "gpu_minutes_left": round(left / (self._usd_per_replica_s() * 60), 1)}
+    def wake(self, reason: str, heavy: bool = False) -> Tuple[int, dict]:
+        with self._tick_guard:
+            self._tick()
+            with self.lock:
+                now = self._now()
+                if self.wake_disabled:
+                    self._log("wake_refused", reason=reason, why="guard")
+                    return 503, {"ok": False, "refused": "guard", "detail": self.wake_disabled}
+                left, period = self.headroom(now)
+                reserve = self.cfg.wake_reserve_s * self._usd_per_replica_s()
+                cap = self._cap_hit(now)
+                if cap or left < reserve:
+                    period = cap or period
+                    self._log("wake_refused", reason=reason, why=f"cap_{period}", headroom_usd=round(left, 2))
+                    return 409, {"ok": False, "refused": f"cap_{period}", "headroom_usd": round(max(left, 0), 2),
+                                 "reserve_usd": round(reserve, 2), "resets_at": self._resets_at(now, period)}
+                self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
+                snap = self.snapshot
+                if snap is not None and snap.desired > 0:    # already up or waking
+                    self.wake_at = self.wake_at or now
+                    self.wake_reason = self.wake_reason or reason
+                    self.heavy = self.heavy or heavy
+                    self._save()
+                    return 200, {"ok": True, "b200": snap.label, "headroom_usd": round(left, 2)}
+            err = self._act(now, (1, f"wake_{reason}"))      # asleep, or still draining from a scale-down
+            if err is not None:
+                return 502, {"ok": False, "refused": "scale_error", "detail": err}
+            with self.lock:
+                self.wake_at, self.wake_reason = now, reason
+                self.heavy = self.heavy or heavy
+                self._save()
+                return 202, {"ok": True, "b200": "waking", "headroom_usd": round(left, 2),
+                             "gpu_minutes_left": round(left / (self._usd_per_replica_s() * 60), 1)}
+
+    def _schedule_sleep(self, now: float, delay_s: float, reason: str) -> Tuple[int, dict]:
+        """Caller holds self.lock."""
+        self.sleep_at, self.sleep_reason, self.sleep_requested_at = now + delay_s, reason, now
+        self._log("sleep_scheduled", reason=reason, at=iso(self.sleep_at))
+        return 202, {"ok": True, "sleep_at": iso(self.sleep_at)}
 
     def sleep(self, delay_s: float, reason: str) -> Tuple[int, dict]:
-        with self.lock:
-            now = self.clock()
-            if delay_s <= 0:
-                self.tick()
+        if not math.isfinite(delay_s):
+            raise ValueError("delay_s must be a finite number")
+        delay_s = min(max(delay_s, 0.0), MAX_DELAY_S)
+        if delay_s > 0:
+            with self.lock:
+                return self._schedule_sleep(self._now(), delay_s, reason)
+        with self._tick_guard:
+            self._tick()
+            with self.lock:
+                now = self._now()
                 snap = self.snapshot
-                if snap is not None and snap.active:
-                    self._down(now, snap, reason)
-                return 202, {"ok": True, "sleeping": "now"}
-            self.sleep_at, self.sleep_reason, self.sleep_requested_at = now + delay_s, reason, now
-            self._log("sleep_scheduled", reason=reason, at=iso(self.sleep_at))
-            return 202, {"ok": True, "sleep_at": iso(self.sleep_at)}
+                if snap is None:                         # never read the deployment: ask Fireworks anyway
+                    action: Optional[Tuple[int, str]] = (0, reason)
+                else:
+                    action = self._down(now, snap, reason) if snap.active else None
+                self._save()
+            err = self._act(now, action) if action is not None else None
+        if err is not None:
+            return 502, {"ok": False, "refused": "scale_error", "detail": err}
+        return 202, {"ok": True, "sleeping": "now"}
 
     def set_heavy(self, on: bool) -> Tuple[int, dict]:
+        if on:
+            return self.wake("heavy", heavy=True)
         with self.lock:
-            if not on:
-                self.heavy = False
-                return self.sleep(0, "heavy_off")
-            code, body = self.wake("heavy")
-            if code < 300:
-                self.heavy = True
-            return code, body
+            self.heavy = False
+        return self.sleep(0, "heavy_off")
 
     def session_start(self, session_id: str) -> Tuple[int, dict]:
         with self.lock:
-            now = self.clock()
-            self.sessions[session_id or f"anon-{now}"] = now
+            now = self._now()
+            key = session_id or f"anon-{now}"
+            if key not in self.sessions and len(self.sessions) >= MAX_TRACKED:
+                return 429, {"ok": False, "error": f"too many open sessions ({MAX_TRACKED})"}
+            self.sessions[key] = now
             if self.sleep_reason == "session_end":
                 self._log("sleep_cancelled", why="new session")
                 self.sleep_at = self.sleep_reason = self.sleep_requested_at = None
+            self._save()
             return 200, self._brief(now)
 
     def session_end(self, session_id: str) -> Tuple[int, dict]:
         with self.lock:
-            now = self.clock()
-            self.sessions.pop(session_id, None)
-            if not self.sessions and (self.snapshot is None or self.snapshot.active):
-                return self.sleep(self.cfg.session_end_sleep_s, "session_end")
-            return 200, {"ok": True, "sessions": len(self.sessions)}
+            now = self._now()
+            known = self.sessions.pop(session_id, None) is not None
+            self._save()
+            # Only the end of a session we know about may put the B200 to sleep: an unknown id (lost registry,
+            # another client) must not cut short a run that a live session is using.
+            if not (known and not self.sessions and (self.snapshot is None or self.snapshot.active)):
+                return 200, {"ok": True, "sessions": len(self.sessions), "known": known}
+            if self.cfg.session_end_sleep_s > 0:         # scheduled under the same lock as the check above
+                return self._schedule_sleep(now, min(self.cfg.session_end_sleep_s, MAX_DELAY_S), "session_end")
+        return self.sleep(0, "session_end")              # configured to sleep at once: needs the tick guard
 
     def touch(self, event: str, call_id: str) -> Tuple[int, dict]:
         with self.lock:
-            now = self.clock()
-            if event == "start":
-                self.inflight[call_id or f"anon-{now}"] = now
-            elif event == "end":
-                self.inflight.pop(call_id, None)
-            else:
+            if event not in ("start", "end"):
                 return 400, {"error": "event must be start or end"}
+            if not call_id:
+                return 400, {"error": "call_id is required"}
+            now = self._now()
+            lease = self.cfg.request_lease_s
+            if event == "start":
+                ended = self.ended.get(call_id)
+                if ended is not None and now - ended <= 2 * lease:
+                    self._log("late_start_ignored", call_id=call_id)   # its end already arrived
+                    return 200, {"ok": True, "ignored": "call already ended", "inflight": len(self.inflight)}
+                if call_id not in self.inflight and len(self.inflight) >= MAX_TRACKED:
+                    return 429, {"ok": False, "error": f"too many in-flight requests ({MAX_TRACKED})"}
+                self.inflight[call_id] = now
+            else:
+                self.inflight.pop(call_id, None)
+                self.ended[call_id] = now
+                self.ended.move_to_end(call_id)
+                while len(self.ended) > ENDED_KEEP:
+                    self.ended.popitem(last=False)
             self.last_traffic = now
+            self._save()
             return 200, {"ok": True, "inflight": len(self.inflight)}
 
     def signal_429(self, model_group: str) -> Tuple[int, dict]:
         with self.lock:
-            now = self.clock()
+            now = self._now()
             self._expire(now)
             self.storm.append(now)
             self._log("rate_limited", model_group=model_group, in_window=len(self.storm))
-            if len(self.storm) >= self.cfg.storm_count:
-                self.storm.clear()
-                return self.wake("429_storm")
-            return 202, {"ok": True, "counted": len(self.storm), "needed": self.cfg.storm_count}
+            if len(self.storm) < self.cfg.storm_count:
+                return 202, {"ok": True, "counted": len(self.storm), "needed": self.cfg.storm_count}
+            self.storm.clear()
+        return self.wake("429_storm")                    # outside self.lock: wake takes the tick guard first
 
     # ---- views
     def _brief(self, now: float) -> dict:
@@ -747,7 +1035,7 @@ class Lifecycle:
 
     def status(self) -> dict:
         with self.lock:
-            now = self.clock()
+            now = self._now()
             snap = self.snapshot
             day, week = self.spend(now)
             left, period = self.headroom(now)
@@ -757,20 +1045,21 @@ class Lifecycle:
             return {
                 "version": __version__, "deployment": self.cfg.deployment, "dry_run": self.cfg.dry,
                 "b200": snap.label if snap else "unknown",
-                "burst_ready": bool(snap and snap.up and snap.state in ("READY", "UPDATING")),
+                "burst_ready": bool(snap and snap.up and snap.desired > 0 and snap.state in ("READY", "UPDATING")),
                 "replicas": snap.replicas if snap else None, "desired": snap.desired if snap else None,
                 "heavy": self.heavy, "wake_reason": self.wake_reason,
                 "spend_day_usd": round(day, 2), "spend_week_usd": round(week, 2),
                 "cap_day_usd": self.cfg.cap_day_usd, "cap_week_usd": self.cfg.cap_week_usd,
                 "headroom_usd": round(max(left, 0.0), 2), "binding_cap": period, "capped": self.capped,
-                "resets_at": iso(next_rollover(now, self.cfg.tz, period)),
+                "resets_at": self._resets_at(now, period), "ledger_lost_until": iso(self.ledger_lost_until),
                 "usd_per_hour_running": round(self._gpus() * self.cfg.gpu_rate_usd_per_hour, 2),
                 "wake_disabled": self.wake_disabled, "checks": self.report.as_dict() if self.report else None,
                 "sleep_at": iso(self.sleep_at), "sleep_reason": self.sleep_reason,
                 "idle_for_s": idle_for, "idle_sleep_s": self.cfg.idle_sleep_s,
                 "sessions": len(self.sessions), "inflight": len(self.inflight),
+                "request_lease_s": self.cfg.request_lease_s,
                 "last_traffic": iso(self.last_traffic), "api_errors": self.api_errors,
-                "unmetered_gap_s": round(self.unmetered_gap_s),
+                "loop_period_s": round(self.loop_period_s, 1) if self.loop_period_s is not None else None,
                 "auto_delete": ("verified off" if self.cfg.autodelete_verified else
                                 "risk accepted" if self.cfg.autodelete_accept_risk else "unverified"),
                 "days_since_b200_traffic": (round((now - self.last_traffic) / 86400, 1)
@@ -781,9 +1070,29 @@ class Lifecycle:
 
 # --------------------------------------------------------------------------- HTTP API
 
+def _delay(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("delay_s must be a number")
+    secs = float(value)
+    if not math.isfinite(secs):
+        raise ValueError("delay_s must be a finite number")
+    return min(max(secs, 0.0), MAX_DELAY_S)
+
+
+def _flag(value: Any, name: str) -> bool:
+    if value is True or value is False:
+        return value
+    raise ValueError(f"{name} must be true or false")
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
 def make_handler(ctl: Lifecycle):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"gem-lifecycle/{__version__}"
+        timeout = 5                                      # a client that stalls mid-request loses its connection
 
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet; the controller logs decisions itself
             return
@@ -796,46 +1105,59 @@ def make_handler(ctl: Lifecycle):
             self.end_headers()
             self.wfile.write(body)
 
-        def _authed(self) -> bool:
-            tok = ctl.cfg.token
-            got = self.headers.get("Authorization", "")
-            return bool(tok) and hmac.compare_digest(got.encode(), f"Bearer {tok}".encode())
+        def _allowed(self, method: str, path: str) -> bool:
+            """True if the bearer belongs to a role allowed on this route; otherwise sends 401, 404 or 403."""
+            got = self.headers.get("Authorization", "").encode()
+            roles = set()
+            for role, tok in ctl.cfg.role_tokens().items():   # a role without a token is disabled
+                if tok and hmac.compare_digest(got, f"Bearer {tok}".encode()):
+                    roles.add(role)
+            if not roles:
+                self._send(401, {"error": "unauthorized"})
+                return False
+            allowed = ROUTE_ROLES.get((method, path))
+            if allowed is None:
+                self._send(404, {"error": "not found"})
+                return False
+            if not roles.intersection(allowed):
+                self._send(403, {"error": f"forbidden for the {'/'.join(sorted(roles))} token"})
+                return False
+            return True
 
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
             if path == "/health":
                 return self._send(200, {"status": "ok", "version": __version__})
-            if not self._authed():
-                return self._send(401, {"error": "unauthorized"})
-            if path == "/status":
-                return self._send(200, ctl.status())
-            return self._send(404, {"error": "not found"})
+            if not self._allowed("GET", path):
+                return None
+            return self._send(200, ctl.status())
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._authed():
-                return self._send(401, {"error": "unauthorized"})
+            path = self.path.split("?", 1)[0]
+            if not self._allowed("POST", path):
+                return None
             try:
-                n = int(self.headers.get("Content-Length") or 0)
+                length = (self.headers.get("Content-Length") or "0").strip()
+                if not re.fullmatch(r"[0-9]{1,9}", length):
+                    raise ValueError("Content-Length must be a non-negative integer")
+                n = int(length)
                 if n > 4096:
                     raise ValueError("body too large")
                 raw = self.rfile.read(n) if n else b""
-                b = json.loads(raw) if raw.strip() else {}
+                b = json.loads(raw, parse_constant=_no_constant) if raw.strip() else {}
                 if not isinstance(b, dict):
                     raise ValueError("body must be a JSON object")
                 routes: Dict[str, Callable[[], Tuple[int, dict]]] = {
                     "/wake": lambda: ctl.wake(str(b.get("reason", "manual"))[:40]),
-                    "/sleep": lambda: ctl.sleep(float(b.get("delay_s", 0)), str(b.get("reason", "manual"))[:40]),
-                    "/heavy": lambda: ctl.set_heavy(bool(b.get("on"))),
+                    "/sleep": lambda: ctl.sleep(_delay(b.get("delay_s", 0)), str(b.get("reason", "manual"))[:40]),
+                    "/heavy": lambda: ctl.set_heavy(_flag(b.get("on"), "on")),
                     "/session/start": lambda: ctl.session_start(str(b.get("session_id", ""))[:128]),
                     "/session/end": lambda: ctl.session_end(str(b.get("session_id", ""))[:128]),
                     "/touch": lambda: ctl.touch(str(b.get("event", "")), str(b.get("call_id", ""))[:128]),
                     "/signal/429": lambda: ctl.signal_429(str(b.get("model_group", ""))[:40]),
                     "/check": ctl.recheck,
                 }
-                fn = routes.get(self.path.split("?", 1)[0])
-                if fn is None:
-                    return self._send(404, {"error": "not found"})
-                code, obj = fn()
+                code, obj = routes[path]()
             except (ValueError, TypeError) as exc:
                 return self._send(400, {"error": str(exc)})
             return self._send(code, obj)
@@ -863,7 +1185,7 @@ def cmd_serve(cfg: Config) -> int:
     if not cfg.api_key:
         errs.append("FIREWORKS_API_KEY is not set")
     if len(cfg.token) < 16:
-        errs.append("GEM_LIFECYCLE_TOKEN must be set (at least 16 characters)")
+        errs.append("GEM_LIFECYCLE_TOKEN (operator) must be set (at least 16 characters)")
     if errs:
         for e in errs:
             sys.stderr.write(f"gem_lifecycle: {e}\n")
@@ -875,14 +1197,14 @@ def cmd_serve(cfg: Config) -> int:
     stop = threading.Event()
 
     def loop() -> None:
-        last_check = time.time()
+        last_check = time.monotonic()
         while not stop.is_set():
             try:
                 ctl.tick()
                 transient = bool(ctl.report and ctl.report.info.get("transient"))
-                if transient or time.time() - last_check >= cfg.recheck_s:
+                if transient or time.monotonic() - last_check >= cfg.recheck_s:
                     ctl.recheck()
-                    last_check = time.time()
+                    last_check = time.monotonic()
             except Exception as exc:  # noqa: BLE001 - the loop must survive anything
                 ctl._log("tick_error", detail=repr(exc))
             stop.wait(cfg.poll_s)
@@ -895,7 +1217,8 @@ def cmd_serve(cfg: Config) -> int:
     signal.signal(signal.SIGINT, shutdown)
     threading.Thread(target=loop, name="gem-lifecycle-loop", daemon=True).start()
     ctl._log("serving", bind=f"{host}:{port}", deployment=cfg.deployment, dry_run=cfg.dry,
-             caps={"day": cfg.cap_day_usd, "week": cfg.cap_week_usd})
+             caps={"day": cfg.cap_day_usd, "week": cfg.cap_week_usd},
+             roles=[role for role, tok in cfg.role_tokens().items() if tok])
     srv.serve_forever()
     with ctl.lock:
         ctl._save()
@@ -919,26 +1242,37 @@ def cmd_check(cfg: Config) -> int:
 # --------------------------------------------------------------------------- dry run (simulated world)
 
 class FakeClock:
+    """Wall clock plus its own monotonic clock. advance() moves both; step() moves only the wall (an NTP step)."""
+
     def __init__(self, start: float):
         self.now = float(start)
+        self.mono_now = 1000.0
 
     def __call__(self) -> float:
         return self.now
 
+    def mono(self) -> float:
+        return self.mono_now
+
     def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self.mono_now += seconds
+
+    def step(self, seconds: float) -> None:
         self.now += seconds
 
 
 class FakeFireworks:
     """A deployment that obeys the documented behaviour: cold start delay, 503 + autoscaler wake when at zero."""
 
-    def __init__(self, clock: FakeClock, cold_start_s: float = 120.0, gpus: int = 4, min_replicas: int = 0,
-                 extra: Optional[dict] = None, scale_to_zero: str = "300s"):
+    def __init__(self, clock: Callable[[], float], cold_start_s: float = 120.0, gpus: int = 4, min_replicas: int = 0,
+                 extra: Optional[dict] = None, scale_to_zero: str = "300s", drain_s: float = 0.0):
         self.clock, self.cold_start_s, self.gpus, self.min_replicas = clock, cold_start_s, gpus, min_replicas
         self.extra = {"unusedAutoDeleteDuration": "0s"} if extra is None else extra
-        self.scale_to_zero = scale_to_zero
+        self.scale_to_zero, self._drain_s = scale_to_zero, drain_s
         self.replicas = self.desired = 0
         self._up_at: Optional[float] = None
+        self._down_at: Optional[float] = None
         self.calls: List[Tuple[float, int]] = []
         self.billed_gpu_s = 0.0
         self._last = clock()
@@ -949,7 +1283,7 @@ class FakeFireworks:
         self._last = now
         if self.desired > self.replicas and self._up_at is not None and now >= self._up_at:
             self.replicas = self.desired
-        if self.desired < self.replicas:
+        if self.desired < self.replicas and (self._down_at is None or now >= self._down_at):
             self.replicas = self.desired
 
     def get(self) -> dict:
@@ -966,6 +1300,8 @@ class FakeFireworks:
         self.calls.append((self.clock(), n))
         if n > self.replicas:
             self._up_at = self.clock() + self.cold_start_s
+        if n < self.replicas:
+            self._down_at = self.clock() + self._drain_s
         self.desired = n
 
     def request(self) -> int:
@@ -1158,6 +1494,67 @@ def scenario_autodelete_guard() -> Tuple[bool, str]:
     return results == want, ", ".join(f"{k} -> {v}" for k, v in results.items())
 
 
+def _restarted(prev: Lifecycle, client: Any, clock: FakeClock) -> Lifecycle:
+    ctl = Lifecycle(prev.cfg, client, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    return ctl
+
+
+def scenario_restart_gap() -> Tuple[bool, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        clock, fake, a = _sim(state_path=os.path.join(tmp, "lifecycle.json"), fake={"cold_start_s": 0})
+        a.set_heavy(True)
+        _run(clock, a, 60)
+        clock.advance(1800)                                   # controller down 30 min while the GPU bills ...
+        fake.scale(0)                                         # ... until Fireworks' own backstop drains it
+        clock.advance(60)
+        b = _restarted(a, fake, clock)
+        b.tick()
+        billed = fake.billed_gpu_s * b.cfg.gpu_rate_usd_per_hour / 3600.0
+        day, _ = b.spend()
+        gap = [e for e in b.events if e["event"] == "restart_gap_billed"]
+        code, body = b.set_heavy(True)
+        ok = bool(gap) and gap[0]["seconds"] == 1860 and day >= billed and b.capped == "day" and code == 409
+    return ok, f"30 min outage with the GPU up, drained before the restart: gap {gap[0]['seconds'] if gap else '?'}s " \
+               f"billed ${gap[0]['usd'] if gap else '?'}; metered ${day:.2f} >= billed ${billed:.2f}; " \
+               f"daily cap tripped, next wake -> {code} {body.get('refused')}"
+
+
+def scenario_ledger_lost() -> Tuple[bool, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "lifecycle.json")
+        clock, fake, a = _sim(state_path=path)
+        _preload(a, day_usd=25.9, week_usd=77.9)
+        a._save()
+        open(path, "w").close()                               # zero-length ledger after a crash
+        b = _restarted(a, fake, clock)
+        code1, body1 = b.set_heavy(True)
+        st = b.status()
+        c = _restarted(b, fake, clock)                        # the refusal itself survives another restart
+        code2, _ = c.set_heavy(True)
+        clock.advance(next_rollover(clock.now, c.cfg.tz, "week") - clock.now + 60)
+        code3, _ = c.set_heavy(True)
+        ok = code1 == 409 and body1.get("refused") == "cap_ledger" and st["ledger_lost_until"] == body1["resets_at"] \
+            and st["capped"] == "ledger" and code2 == 409 and code3 == 202
+    return ok, f"empty ledger -> wake {code1} {body1.get('refused')} until {body1.get('resets_at')}; " \
+               f"after another restart {code2}; after the weekly rollover {code3}"
+
+
+def scenario_wake_during_drain() -> Tuple[bool, str]:
+    clock, fake, ctl = _sim(fake={"cold_start_s": 0, "drain_s": 40})
+    ctl.set_heavy(True)
+    _run(clock, ctl, 15)
+    ctl.set_heavy(False)                                      # heavy off ...
+    clock.advance(5)
+    code, _ = ctl.set_heavy(True)                             # ... and on again while the replica drains
+    ready = ctl.status()["burst_ready"]
+    _run(clock, ctl, 60)
+    ok = code == 202 and fake.desired == 1 and fake.replicas == 1 and ctl.heavy and \
+        ctl.scale_calls[-1][1] == 1
+    return ok, f"heavy on 5 s into a 40 s drain -> {code}, scale to 1 sent; 60 s later replicas={fake.replicas} " \
+               f"desired={fake.desired} (burst_ready right after the call: {ready})"
+
+
 SCENARIOS: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
     ("idle 180 s -> sleep", scenario_idle_sleep),
     ("SessionEnd -> sleep at +45 s", scenario_session_end),
@@ -1168,6 +1565,9 @@ SCENARIOS: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
     ("uncapped stray wake (single fallback) is undone", scenario_stray_wake),
     ("429 storm wakes the B200", scenario_429_storm),
     ("auto-delete / min-replica guard blocks wakes", scenario_autodelete_guard),
+    ("restart bills the whole unobserved gap", scenario_restart_gap),
+    ("damaged ledger refuses wakes until the weekly rollover", scenario_ledger_lost),
+    ("heavy on during a drain scales back up", scenario_wake_during_drain),
 ]
 
 

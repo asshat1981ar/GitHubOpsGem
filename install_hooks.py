@@ -9,6 +9,9 @@ Copies gemcore + gemctl to $GEM_HOME/lib and the hooks to $GEM_HOME/hooks (defau
 three hook entries (PreToolUse, SessionStart, SessionEnd) into
 ~/.claude/settings.json. Entries are tagged by their command path, so re-running
 replaces them instead of duplicating, and every other setting is left untouched.
+
+It never copies or creates the B200 controller's operator token. Put that token in $GEM_HOME/operator.token
+yourself (see TOKEN_HELP); the hooks only use GEM_LIFECYCLE_SESSION_TOKEN.
 """
 
 from __future__ import annotations
@@ -22,6 +25,11 @@ import sys
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 MARK = "/.gem/hooks/gem_"   # identifies entries this installer owns
+TOKEN_HELP = """B200 controller tokens (on awsbox: sudo grep '^GEM_LIFECYCLE_' /etc/gem/lifecycle.env):
+  session   export GEM_LIFECYCLE_SESSION_TOKEN=<value> before sourcing gateway/claude-gem.env (hooks use it)
+  operator  never exported; paste it into {path} for `gem heavy`:
+              (umask 077; cat > {path})        # paste the GEM_LIFECYCLE_TOKEN value, Enter, Ctrl-D
+              chmod 600 {path}"""
 
 
 def hook_entries(gem_home: str) -> dict:
@@ -94,8 +102,8 @@ def main() -> int:
     print(("Removed" if a.remove else "Installed") + f" GitHubOpsGem hooks ({a.settings}; files in {a.gem_home}).")
     if not a.remove:
         print("Set GEM_ENFORCEMENT / GEM_ENFORCE_AFTER and AUTODEV_URL / AUTODEV_API_BEARER_TOKEN "
-              "(see gateway/claude-gem.env), plus GEM_LIFECYCLE_TOKEN for the B200 controller, "
-              "then restart Claude Code and run /hooks to confirm.")
+              "(see gateway/claude-gem.env), then restart Claude Code and run /hooks to confirm.")
+        print(TOKEN_HELP.format(path=os.path.join(a.gem_home, "operator.token")))
     return 0
 
 
