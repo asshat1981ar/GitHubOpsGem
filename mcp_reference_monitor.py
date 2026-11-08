@@ -40,6 +40,11 @@ v5.4 (WU-04 gemctl, WU-08 hooks):
     matching ForgeCore's vocabulary. Found by the hook tests: a bare `git push origin main` passed.
   * evaluate_write(extra_violations=...) so hook-detected issues (force push, --all) are part of the
     claim ForgeCore signs, not added after the signature.
+
+fix/cwe94-precision:
+  * CWE-94_WORKFLOW_INJECTION only in execution sinks (`run:`, actions/github-script `script:`) and only for
+    attacker-controllable contexts (UntrustedContextPolicy deny/allow lists). It used to fire on any
+    `${{ github.event.* }}` anywhere, e.g. a `concurrency:` group or the `env:` binding it recommends.
 """
 
 from __future__ import annotations
@@ -283,6 +288,551 @@ class DiffHunkValidator:
         return plan
 
 
+# --------------------------------------------------------------------------- workflow expression injection (CWE-94)
+
+class UntrustedContextPolicy:
+    """Which `${{ }}` contexts can carry attacker-chosen text.
+
+    GitHub pastes the text of a `${{ }}` expression into the step before the step runs. That is code
+    injection (CWE-94) only when the text lands in code that is executed (WorkflowInjectionScanner decides
+    that) AND an attacker can choose the value (this class decides that). An expression is unsafe if ANY
+    context it reads is unsafe, whatever operators or functions combine them (`a || b`, `format()`,
+    `contains()`, `toJSON()`).
+
+    Sources for DENY:
+      * CodeQL's actions model of untrusted event properties: github/codeql
+        actions/ql/lib/ext/config/untrusted_event_properties.yml, plus `github.head_ref` from
+        actions/ql/lib/codeql/actions/dataflow/FlowSources.qll (GitHubCtxSource).
+      * GitHub Docs, "Script injections" (docs.github.com/en/actions/concepts/security/script-injections), and
+        the GitHub blog "How to secure GitHub Actions workflows: 4 tips to handle untrusted input".
+      * zizmor's template-injection audit (docs.zizmor.sh/audits/#template-injection), which also reports
+        `inputs.*` and non-static `env.*` expanded in code, and step outputs at informational severity.
+        Here `inputs.*`, `steps.*.outputs.*` and `needs.*.outputs.*` are reported at full severity: they can
+        carry arbitrary text from an untrusted caller or an earlier step.
+    A context that is an ancestor of a DENY entry is unsafe too, because the object contains that field
+    (`toJSON(github.event.pull_request)`, `toJSON(github)`): CodeQL models these as JSON sources.
+
+    Contexts on neither list are not reported. Only attacker-controllable data is injection; numbers, SHAs,
+    ids and names that GitHub or the repository's writers choose are not.
+    """
+
+    DENY: Tuple[str, ...] = (
+        # Branch names the PR author chooses. Only the head branch: see ALLOW for github.ref and friends.
+        "github.head_ref",
+        "github.event.pull_request.head.ref",
+        "github.event.pull_request.head.label",
+        "github.event.pull_request.head.repo.default_branch",
+        "github.event.workflow_run.head_branch",
+        "github.event.workflow_run.pull_requests.*.head.ref",
+        "github.event.merge_group.head_ref",
+        "github.event.changes.head.ref.from",
+        # Titles and free text written by whoever opens the issue, PR, comment, review, discussion or wiki page.
+        "github.event.issue.title",
+        "github.event.issue.body",
+        "github.event.pull_request.title",
+        "github.event.pull_request.body",
+        "github.event.pull_request.head.repo.description",
+        "github.event.pull_request.head.repo.homepage",
+        "github.event.discussion.title",
+        "github.event.discussion.body",
+        "github.event.comment.body",
+        "github.event.review.body",
+        "github.event.review_comment.body",
+        "github.event.pages.*.page_name",
+        "github.event.pages.*.title",
+        "github.event.changes.title.from",
+        "github.event.changes.body.from",
+        "github.event.workflow_run.display_title",
+        "github.event.workflow_run.head_repository.description",
+        # Commit metadata: anyone can set the message and the author/committer name and e-mail of a commit.
+        "github.event.commits.*.message",
+        "github.event.commits.*.author.email",
+        "github.event.commits.*.author.name",
+        "github.event.commits.*.committer.email",
+        "github.event.commits.*.committer.name",
+        "github.event.head_commit.message",
+        "github.event.head_commit.author.email",
+        "github.event.head_commit.author.name",
+        "github.event.head_commit.committer.email",
+        "github.event.head_commit.committer.name",
+        "github.event.workflow_run.head_commit.message",
+        "github.event.workflow_run.head_commit.author.*",
+        "github.event.workflow_run.head_commit.committer.*",
+        "github.event.merge_group.committer.email",
+        "github.event.merge_group.committer.name",
+        # File paths taken from the triggering repository.
+        "github.event.workflow.path",
+        "github.event.workflow_run.path",
+        "github.event.workflow_run.referenced_workflows.*.path",
+        # workflow_dispatch / workflow_call inputs: free text whenever the caller is untrusted.
+        "inputs.*",
+        "github.event.inputs.*",
+        # Values produced at run time; they can carry untrusted data from an earlier step or job.
+        "steps.*.outputs.*",
+        "needs.*.outputs.*",
+    )
+
+    ALLOW: Tuple[str, ...] = (
+        # Numbers, SHAs and run identifiers.
+        "github.event.pull_request.number",
+        "github.event.issue.number",
+        "github.event.number",
+        "github.sha",
+        "github.event.pull_request.head.sha",
+        "github.event.pull_request.base.sha",
+        "github.run_id",
+        "github.run_number",
+        "github.run_attempt",
+        # Names GitHub or the repository's writers set.
+        "github.repository",
+        "github.repository_owner",
+        "github.workflow",
+        "github.job",
+        "github.event_name",
+        "github.ref_type",
+        # Deliberate choice: github.ref, github.base_ref and github.ref_name are treated as safe. An attacker
+        # could influence them only through branch names, and on pull_request they name the PR merge ref
+        # (refs/pull/<n>/merge) and the base branch, which only the base repository's writers create. On push
+        # and the other events they name a ref that someone with write access pushed. The only branch name a
+        # PR author chooses is the head branch, and github.head_ref / pull_request.head.ref are in DENY.
+        "github.ref",
+        "github.base_ref",
+        "github.ref_name",
+        # runner.* is set by the runner. matrix.* is assumed static (a matrix built with fromJSON() from
+        # untrusted data would not be; that is not evaluated here). secrets.* are not attacker-controlled;
+        # exposing a secret in a script is a different issue, handled by the secret rules, not CWE-94.
+        "runner.*",
+        "matrix.*",
+        "secrets.*",
+    )
+
+    _DENY = tuple(tuple(p.split(".")) for p in DENY)
+    _ALLOW = tuple(tuple(p.split(".")) for p in ALLOW)
+    _CHAIN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|\*))*")
+    _STRING_INDEX_RE = re.compile(r"\[\s*'((?:[^']|'')*)'\s*\]")
+    _STRING_RE = re.compile(r"'(?:[^']|'')*'")
+    _INDEX_RE = re.compile(r"\[([^\[\]]*)\]")
+    _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+    @staticmethod
+    def _compatible(chain: Tuple[str, ...], pattern: Tuple[str, ...]) -> bool:
+        # Compared over the shorter length: equal, a field below the pattern, or an object above it.
+        return all(c == p or "*" in (c, p) for c, p in zip(chain, pattern))
+
+    @classmethod
+    def contexts(cls, expr: str) -> List[str]:
+        """Context paths an expression reads, e.g. `github.event.commits.*.message` (as written; contexts
+        are case-insensitive, so compare them lower-cased).
+
+        `x['key']` becomes `x.key`; `x[0]` and `x[<expr>]` become `x.*` (the inner expression is read too).
+        String literals and function names are not contexts.
+        """
+        def index_key(m: "re.Match[str]") -> str:
+            key = m.group(1).replace("''", "'")
+            return "." + key if cls._IDENT_RE.match(key) else ".*"
+
+        text = cls._STRING_RE.sub("''", cls._STRING_INDEX_RE.sub(index_key, expr))
+        inner: List[str] = []
+
+        def index_any(m: "re.Match[str]") -> str:
+            inner.append(m.group(1))
+            return ".*"
+
+        while True:
+            reduced = cls._INDEX_RE.sub(index_any, text)
+            if reduced == text:
+                break
+            text = reduced
+        found: List[str] = []
+        for src in (text, *inner):
+            for m in cls._CHAIN_RE.finditer(src):
+                if src[m.end():].lstrip().startswith("("):
+                    continue  # function call: toJSON(...), format(...)
+                if m.group(0).lower() not in (f.lower() for f in found):
+                    found.append(m.group(0))
+        return found
+
+    @classmethod
+    def classify(cls, context: str) -> str:
+        """'unsafe' (attacker-controllable), 'safe' (on ALLOW) or 'unlisted'. DENY wins over ALLOW."""
+        chain = tuple(context.lower().split("."))
+        if any(cls._compatible(chain, p) for p in cls._DENY):
+            return "unsafe"
+        if any(len(chain) >= len(p) and cls._compatible(chain, p) for p in cls._ALLOW):
+            return "safe"
+        return "unlisted"
+
+    @classmethod
+    def unsafe_contexts(cls, expr: str, tainted_env: Iterable[str] = ()) -> List[str]:
+        """The unsafe contexts in one expression. `env.NAME` is unsafe when NAME is in tainted_env."""
+        tainted = {n.lower() for n in tainted_env}
+        out: List[str] = []
+        for ctx in cls.contexts(expr):
+            seg = ctx.lower().split(".")
+            if seg[0] == "env":
+                hit = bool(tainted) if len(seg) == 1 or seg[1] == "*" else seg[1] in tainted
+            else:
+                hit = cls.classify(ctx) == "unsafe"
+            if hit:
+                out.append(ctx)
+        return out
+
+
+@dataclass
+class _YamlFrame:
+    col: int                                # column of the key, or of the "-" of a sequence item
+    kind: str                               # "key" | "item"
+    key: str = ""                           # unquoted key, lower-cased
+    name: str = ""                          # unquoted key as written (env variable names)
+    step: Optional[Dict[str, str]] = None   # sequence items: what this file shows of the item ("uses")
+    has_value: bool = False                 # key with an inline value (scalar, block or flow): no child keys
+
+
+@dataclass
+class _Sink:
+    kind: str                               # "run" | "script" | "unknown"
+    step: Optional[Dict[str, str]] = None   # for "script": the step whose `uses:` must be github-script
+
+
+@dataclass
+class _ValueCont:
+    col: int                                # lines indented deeper than this continue the value
+    sink: Optional[_Sink]
+    env_name: Optional[str]
+    raw: bool                               # block/quoted/unknown text: a '#' there is not a YAML comment
+
+
+class WorkflowInjectionScanner:
+    """CWE-94 expression injection in GitHub Actions workflows and composite actions.
+
+    Only execution sinks are checked, i.e. the places where GitHub substitutes `${{ }}` text into code that
+    is then executed:
+      * the value of a step's `run:` (workflows and composite actions), and
+      * the `script:` input of actions/github-script (any version or ref).
+    `env:` values, other `with:` inputs, job-level `with:`, `if:`, `concurrency`, `name:`, `runs-on`,
+    `timeout-minutes`, outputs, `uses:` and YAML comments pass values as data and are never reported.
+    Inside a sink, a line is reported when it expands a context UntrustedContextPolicy calls unsafe, or
+    `env.NAME` where NAME is bound in this file to an unsafe value (`${{ env.NAME }}` is still a template
+    expansion; zizmor's remediation says to use the shell's "$NAME").
+
+    Structure comes from indentation, line by line, as for the other diff rules: block-mapping keys (plain
+    or quoted), sequence items, and multi-line values (block scalars `|`/`>-`, multi-line plain or quoted
+    scalars) that continue while lines are indented deeper than their key. The walk covers the patch's
+    context and added lines, one hunk at a time; when the caller has the post-image file and it matches every
+    context and added line of the patch, the whole file is walked instead, so the enclosing key of every
+    added line is known. Only added lines are reported.
+
+    When a hunk starts inside a multi-line value whose key lies outside the hunk, the scanner cannot see
+    whether it is a `run:` script. It fails closed: such lines are treated as a `run:` script (most
+    multi-line values in workflows are). A key-looking line at the top of a hunk is taken as a mapping key.
+    """
+
+    KEY_RE = re.compile(r"""(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_$][A-Za-z0-9_.$/-]*)[ \t]*:(?=[ \t]|$)""")
+    BLOCK_HEADER_RE = re.compile(r"^[|>][0-9+-]*$")
+    PROPERTIES_RE = re.compile(r"^(?:[&!]\S*(?:\s+|$))+")  # anchors (&a) and tags (!!str) before a value
+    EXPRESSION_RE = re.compile(r"\$\{\{(?P<expr>.*?)(?:\}\}|$)")  # an unterminated ${{ runs to end of line
+    FLOW_SINK_RE = re.compile(r"""[{,]\s*["']?(?P<key>run|script)["']?\s*:""", re.I)
+    FLOW_USES_RE = re.compile(r"""[{,]\s*["']?uses["']?\s*:\s*["']?(?P<target>[^\s"',}]+)""", re.I)
+    GITHUB_SCRIPT_RE = re.compile(r"^actions/github-script@", re.I)
+    SINK_WORDS = {
+        "run": "a `run:` script",
+        "script": "an actions/github-script `script:`",
+        "unknown": "a multi-line value whose key is outside this diff hunk (treated as a `run:` script)",
+    }
+    FIX_WORDS = {
+        "run": 'map it in the step\'s `env:` (e.g. `TITLE: ${{ github.event.issue.title }}`) and use "$TITLE"',
+        "script": "map it in the step's `env:` and read `process.env.NAME` in the script",
+    }
+
+    @classmethod
+    def findings(cls, file_path: str, patch_text: str, post_image: Optional[str] = None) -> List[InlineFinding]:
+        cands: List[Tuple[int, bool, str, _Sink]] = []
+        env_values: List[Tuple[str, str]] = []
+        for segment in cls._segments(patch_text, post_image):
+            cls._walk(segment, cands, env_values)
+        tainted = cls._tainted_env(env_values)
+        out: List[InlineFinding] = []
+        reported: Set[int] = set()
+        for line, added, text, sink in cands:
+            kind = cls._resolve(sink)
+            if not added or line in reported or kind is None:
+                continue
+            bad: List[str] = []
+            for m in cls.EXPRESSION_RE.finditer(text):
+                bad += [c for c in UntrustedContextPolicy.unsafe_contexts(m.group("expr"), tainted) if c not in bad]
+            if bad:
+                reported.add(line)
+                out.append(InlineFinding(
+                    file_path, max(1, line), Severity.CRITICAL, "CWE-94_WORKFLOW_INJECTION",
+                    f"Untrusted context {', '.join(f'`{c}`' for c in bad)} is expanded by `${{{{ }}}}` inside "
+                    f"{cls.SINK_WORDS[kind]}; GitHub pastes the text into the code before it runs. Instead, "
+                    f"{cls.FIX_WORDS.get(kind, cls.FIX_WORDS['run'])}."))
+        return out
+
+    @staticmethod
+    def _segments(patch_text: str, post_image: Optional[str]) -> List[List[Tuple[int, str, bool]]]:
+        """(new line number, text, added) runs: one per hunk, or the whole post-image if it matches."""
+        hunks: List[List[Tuple[int, str, bool]]] = []
+        prev: Optional[int] = None
+        for pl in iter_patch_lines(patch_text):
+            if pl.kind == "del" or pl.new_line is None:
+                continue
+            if prev is None or pl.new_line != prev + 1:
+                hunks.append([])
+            hunks[-1].append((pl.new_line, pl.content, pl.kind == "add"))
+            prev = pl.new_line
+        if post_image is not None and hunks:
+            lines = [ln[:-1] if ln.endswith("\r") else ln for ln in post_image.split("\n")]
+            if all(0 < n <= len(lines) and lines[n - 1] == text for hunk in hunks for n, text, _ in hunk):
+                added = {n for hunk in hunks for n, _, is_add in hunk if is_add}
+                return [[(n, text, n in added) for n, text in enumerate(lines, 1)]]
+        return hunks
+
+    @classmethod
+    def _walk(cls, lines: List[Tuple[int, str, bool]], cands: List[Tuple[int, bool, str, _Sink]],
+              env_values: List[Tuple[str, str]]) -> None:
+        stack: List[_YamlFrame] = []
+        cont: Optional[_ValueCont] = None
+
+        def emit(ln: int, added: bool, text: str, sink: Optional[_Sink], env_name: Optional[str]) -> None:
+            if sink is not None:
+                cands.append((ln, added, text, sink))
+            if env_name is not None:
+                env_values.append((env_name, text))
+
+        for ln, raw, added in lines:
+            body = raw.rstrip()
+            stripped = body.strip()
+            indent = len(body) - len(body.lstrip(" "))
+            if cont is not None:
+                if not stripped:
+                    continue
+                # Still inside the multi-line value, unless a plain scalar meets a `key:` line: plain scalars
+                # cannot contain ": ", so that line is structure (seen in hand-written or partial diffs).
+                if indent > cont.col and (cont.raw or not cls._has_key(body)):
+                    emit(ln, added, body if cont.raw else cls._strip_comment(body), cont.sink, cont.env_name)
+                    continue
+                cont = None
+            if not stripped or stripped.startswith("#"):
+                continue  # blank line or YAML comment
+            if stripped in ("---", "...") or (indent == 0 and stripped.startswith("%")):
+                stack.clear()
+                continue
+            col, rest, item = indent, body[indent:], None
+            while rest[:1] == "-" and rest[1:2] in ("", " ", "\t"):  # one or more sequence items
+                while stack and (stack[-1].col > col or stack[-1].has_value
+                                 or (stack[-1].kind == "item" and stack[-1].col == col)):
+                    stack.pop()
+                item = _YamlFrame(col, "item", step={})
+                stack.append(item)
+                gap = 1 + len(rest[1:]) - len(rest[1:].lstrip(" \t"))
+                col, rest = col + gap, rest[gap:]
+            if not rest or rest.startswith("#"):
+                continue  # a bare "-": the item's content starts on the next line
+            m = cls.KEY_RE.match(rest)
+            if m:
+                name = cls._unquote(m.group("key"))
+                while stack and (stack[-1].col >= col or stack[-1].has_value):
+                    stack.pop()
+                parent = stack[-1] if stack else None
+                value, style = cls._split_value(rest[m.end():])
+                stack.append(_YamlFrame(col, "key", name.lower(), name, has_value=style != "empty"))
+                sink = cls._sink_for(stack)
+                env_name = name if parent is not None and parent.kind == "key" and parent.key == "env" else None
+                if parent is not None and parent.kind == "item" and stack[-1].key == "uses" and parent.step is not None:
+                    parent.step["uses"] = cls._unquote(value)
+                if style == "flow" and stack[-1].key == "with" and value.startswith("{"):
+                    owner = cls._with_owner(stack)
+                    if owner is not False:
+                        cls._flow_sinks(value, ln, added, cands, owner, allow_run=False)
+                if style == "block":
+                    cont = _ValueCont(col, sink, env_name, raw=True)
+                elif style != "empty":
+                    emit(ln, added, value, sink, env_name)
+                    cont = _ValueCont(col, sink, env_name, raw=style != "plain")
+                continue
+            if item is not None:  # a scalar sequence entry: data, unless it is a flow-mapping step
+                value, style = cls._split_value(rest)
+                if style == "flow" and value.startswith("{") and cls._is_step(stack, len(stack) - 1):
+                    cls._flow_sinks(value, ln, added, cands, item.step, allow_run=True)
+                cont = _ValueCont(item.col, None, None, raw=True)
+                continue
+            # A scalar on a line of its own: the value of the key above it, or the middle of a multi-line value.
+            while stack and stack[-1].col >= indent:
+                stack.pop()
+            owner_frame = stack[-1] if stack else None
+            if owner_frame is None:  # the value's key is outside this hunk: fail closed
+                sink = _Sink("unknown")
+                emit(ln, added, body, sink, None)
+                cont = _ValueCont(indent - 1, sink, None, raw=True)
+            elif owner_frame.kind == "key":
+                parent = stack[-2] if len(stack) > 1 else None
+                env_name = owner_frame.name if parent is not None and parent.kind == "key" and parent.key == "env" else None
+                value, style = cls._split_value(rest)
+                sink = cls._sink_for(stack)
+                emit(ln, added, value, sink, env_name)
+                cont = _ValueCont(owner_frame.col, sink, env_name, raw=style != "plain")
+            else:
+                cont = _ValueCont(owner_frame.col, None, None, raw=True)
+
+    @classmethod
+    def _has_key(cls, line: str) -> bool:
+        """True if the line is a mapping entry (`key: ...` or `- key: ...`)."""
+        rest = line.lstrip(" ")
+        while rest[:1] == "-" and rest[1:2] in ("", " ", "\t"):
+            rest = rest[1:].lstrip(" \t")
+        return bool(cls.KEY_RE.match(rest))
+
+    @staticmethod
+    def _is_step(stack: List[_YamlFrame], i: int) -> bool:
+        """stack[i] is a sequence item. It is a step unless its sequence visibly belongs to a key other than steps."""
+        below = stack[i - 1] if i > 0 else None
+        return below is None or (below.kind == "key" and below.key == "steps")
+
+    @classmethod
+    def _with_owner(cls, stack: List[_YamlFrame]) -> Any:
+        """For a `with:` frame on top of the stack: the step dict it belongs to, None if that step is not in
+        view, or False when the `with:` is not a step's (a job calling a reusable workflow, say)."""
+        i = len(stack) - 2
+        if i < 0:
+            return None
+        if stack[i].kind == "item" and cls._is_step(stack, i):
+            return stack[i].step
+        return False
+
+    @classmethod
+    def _sink_for(cls, stack: List[_YamlFrame]) -> Optional[_Sink]:
+        """The sink whose value the key on top of the stack holds, if any."""
+        frame = stack[-1]
+        parent = stack[-2] if len(stack) > 1 else None
+        if frame.key == "run":
+            if parent is None or (parent.kind == "item" and cls._is_step(stack, len(stack) - 2)):
+                return _Sink("run")
+            return None  # defaults.run, a job named "run", a `run` input in `with:` ...
+        if frame.key == "script":
+            if parent is None:
+                return _Sink("script")
+            if parent.kind == "key" and parent.key == "with":
+                owner = cls._with_owner(stack[:-1])
+                if owner is not False:
+                    return _Sink("script", owner)
+        return None
+
+    @classmethod
+    def _resolve(cls, sink: _Sink) -> Optional[str]:
+        if sink.kind == "script":
+            uses = (sink.step or {}).get("uses")
+            if uses is not None and not cls.GITHUB_SCRIPT_RE.match(uses):
+                return None  # a `script:` input of some other action is data
+        return sink.kind
+
+    @classmethod
+    def _flow_sinks(cls, text: str, ln: int, added: bool, cands: List[Tuple[int, bool, str, _Sink]],
+                    step: Optional[Dict[str, str]], allow_run: bool) -> None:
+        """Sinks inside a one-line flow mapping: `- {run: ...}` or `with: {script: ...}`."""
+        mu = cls.FLOW_USES_RE.search(text)
+        if mu and step is not None:
+            step.setdefault("uses", mu.group("target"))
+        for mk in cls.FLOW_SINK_RE.finditer(text):
+            kind = mk.group("key").lower()
+            if kind == "script" or allow_run:
+                cands.append((ln, added, cls._flow_value(text, mk.end()), _Sink(kind, step)))
+
+    @staticmethod
+    def _flow_value(text: str, start: int) -> str:
+        """The value that starts at `start` in a flow mapping: up to the next ',' or '}' at its own level."""
+        depth, quote, i = 0, "", start
+        while i < len(text):
+            c = text[i]
+            if quote:
+                if c == "\\" and quote == '"':
+                    i += 1
+                elif c == quote:
+                    quote = ""
+            elif c in "\"'":
+                quote = c
+            elif c in "{[":
+                depth += 1
+            elif c in "}]" or c == ",":
+                if depth == 0:
+                    break
+                if c != ",":
+                    depth -= 1
+            i += 1
+        return text[start:i]
+
+    @classmethod
+    def _split_value(cls, text: str) -> Tuple[str, str]:
+        """(value without its YAML comment, style): style is empty|block|quoted|flow|plain."""
+        v = cls.PROPERTIES_RE.sub("", text.strip(), count=1)
+        if not v or v.startswith("#"):
+            return "", "empty"
+        head = v.split(None, 1)
+        if cls.BLOCK_HEADER_RE.match(head[0]) and (len(head) == 1 or head[1].startswith("#")):
+            return "", "block"
+        if v[0] in "\"'":
+            end = cls._quote_end(v)
+            return (v if end < 0 else v[:end + 1]), "quoted"
+        if v[0] in "{[":
+            return cls._strip_comment(v, quotes=True), "flow"
+        return cls._strip_comment(v), "plain"
+
+    @staticmethod
+    def _quote_end(v: str) -> int:
+        """Index of the quote that closes the scalar opened by v[0], or -1 if it continues on later lines."""
+        q, i = v[0], 1
+        while i < len(v):
+            if q == '"' and v[i] == "\\":
+                i += 2
+                continue
+            if v[i] == q:
+                if q == "'" and v[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                return i
+            i += 1
+        return -1
+
+    @staticmethod
+    def _strip_comment(v: str, quotes: bool = False) -> str:
+        """Cut a YAML comment: '#' at the start or after whitespace (outside quotes, if `quotes`)."""
+        quote, i = "", 0
+        while i < len(v):
+            c = v[i]
+            if quote:
+                if c == "\\" and quote == '"':
+                    i += 1
+                elif c == quote:
+                    quote = ""
+            elif quotes and c in "\"'":
+                quote = c
+            elif c == "#" and (i == 0 or v[i - 1] in " \t"):
+                return v[:i].rstrip()
+            i += 1
+        return v
+
+    @staticmethod
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] == '"':
+            return s[1:-1].replace('\\"', '"')
+        if len(s) >= 2 and s[0] == s[-1] == "'":
+            return s[1:-1].replace("''", "'")
+        return s
+
+    @classmethod
+    def _tainted_env(cls, env_values: List[Tuple[str, str]]) -> Set[str]:
+        """Names of env variables bound to an unsafe value anywhere in view (step env may read job env)."""
+        tainted: Set[str] = set()
+        while True:
+            grown = {name.lower() for name, text in env_values
+                     if any(UntrustedContextPolicy.unsafe_contexts(m.group("expr"), tainted)
+                            for m in cls.EXPRESSION_RE.finditer(text))}
+            if grown <= tainted:
+                return tainted
+            tainted |= grown
+
+
 # --------------------------------------------------------------------------- supply chain & secrets
 
 class SupplyChainAndSecretScanner:
@@ -306,15 +856,7 @@ class SupplyChainAndSecretScanner:
             r"(?i)(?:api_key|apikey|secret_key|access_token|auth_token|client_secret)\s*[:=]\s*['\"][A-Za-z0-9_\-]{24,}['\"]")),
     ]
 
-    # Attacker-controllable contexts (GitHub security hardening guide + common sinks).
-    UNTRUSTED_CONTEXT_RE = re.compile(
-        r"github\.head_ref"
-        r"|github\.event\.(?:issue|pull_request|comment|review|review_comment|discussion|discussion_comment"
-        r"|commits|head_commit|pages|workflow_run|merge_group)\b[^}]*"
-        r"(?:title|body|message|ref|label|name|email|head_branch|page_name|default_branch)",
-        re.IGNORECASE,
-    )
-    EXPRESSION_RE = re.compile(r"\$\{\{(?P<expr>.*?)\}\}")
+    # CWE-94 expression injection is WorkflowInjectionScanner (execution sinks + UntrustedContextPolicy).
     WORKFLOW_PATH_RE = re.compile(r"(^|/)\.github/(workflows/[^/]+|actions/.+/action)\.ya?ml$|(^|/)action\.ya?ml$")
 
     @classmethod
@@ -341,10 +883,19 @@ class SupplyChainAndSecretScanner:
         return []
 
     @classmethod
-    def audit_diff(cls, file_path: str, patch_text: str) -> List[InlineFinding]:
+    def audit_diff(cls, file_path: str, patch_text: str, post_image: Optional[str] = None) -> List[InlineFinding]:
+        """Findings on the added lines of one file's unified diff.
+
+        post_image: optional full text of the file after the change. It is used only to give the CWE-94
+        rule the YAML context of each added line, and only when it matches every context and added line of
+        the patch; otherwise the rule works from the patch alone.
+        """
         findings: List[InlineFinding] = []
         is_workflow = bool(cls.WORKFLOW_PATH_RE.search(file_path))
         adds = added_lines(patch_text)
+        injection: Dict[int, InlineFinding] = {}
+        if is_workflow:
+            injection = {f.line: f for f in WorkflowInjectionScanner.findings(file_path, patch_text, post_image)}
         for pl in adds:
             line_no = max(1, pl.new_line or 1)
             for secret_type in cls.scan_text_for_secrets(pl.content):
@@ -355,15 +906,8 @@ class SupplyChainAndSecretScanner:
             m_uses = cls.USES_RE.match(pl.content)
             if m_uses:
                 findings.extend(cls._check_uses(file_path, line_no, m_uses.group("target")))
-            stripped = pl.content.strip().lstrip("- ")
-            if stripped.startswith(("if:", "name:")):
-                continue  # expressions in if:/name: are not shell-interpolated
-            for em in cls.EXPRESSION_RE.finditer(pl.content):
-                if cls.UNTRUSTED_CONTEXT_RE.search(em.group("expr")):
-                    findings.append(InlineFinding(
-                        file_path, line_no, Severity.CRITICAL, "CWE-94_WORKFLOW_INJECTION",
-                        f"Untrusted context `${{{{{em.group('expr').strip()}}}}}` interpolated inline. Bind it via `env:` and quote the variable."))
-                    break
+            if line_no in injection:
+                findings.append(injection.pop(line_no))
         if is_workflow:
             added_text = "\n".join(p.content for p in adds)
             if re.search(r"^\s*pull_request_target\s*:", added_text, re.M) or re.search(r"\bon:\s*\[?[^\n]*pull_request_target", added_text):
