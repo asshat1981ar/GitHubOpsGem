@@ -419,3 +419,50 @@ def test_sim_hostile_file_names_and_binary_content(tmp_path, repo):
     rows = [ln for ln in sim["summary"].splitlines() if ln.startswith("| CRITICAL | `")]
     assert len(rows) == 3 and all(ln.count("|") == 5 for ln in rows)
     assert not any(ln.startswith("::") for ln in sim["summary"].splitlines())
+
+
+# ---------------------------------------------------------------- installed copy, self-caller, rulesets
+INSTALLED = ROOT / ".github" / "workflows" / "gem-review.yml"
+SELF_CALLER = ROOT / ".github" / "workflows" / "gem-review-pr.yml"
+RULESETS = sorted((ROOT / "ci" / "rulesets").glob("*.json"))
+
+
+def test_installed_reusable_workflow_is_the_tested_source():
+    assert INSTALLED.read_bytes() == REUSABLE.read_bytes(), "re-copy ci/gem-review.yml to .github/workflows/"
+
+
+def test_self_caller_is_hardened_and_reviews_with_the_base_commit():
+    w = load(SELF_CALLER)
+    assert set(w[True]) == {"pull_request"} and "pull_request_target" not in SELF_CALLER.read_text()
+    assert w["permissions"] == {"contents": "read", "pull-requests": "read"}
+    (name, job), = jobs(w)
+    assert job["uses"] == "./.github/workflows/gem-review.yml"   # same commit as the caller (see file comment)
+    assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert job["with"]["gem_ref"] == "${{ github.event.pull_request.base.sha }}"
+    assert job["with"]["fail_on"] == "critical" and "secrets" not in job
+    (callee,) = dict(jobs(load(REUSABLE))).values()
+    assert w["concurrency"]["group"] != callee["concurrency"]["group"]
+
+
+def test_ruleset_requires_the_check_that_actually_runs():
+    (caller_job, _), = jobs(load(SELF_CALLER))
+    (callee_job, _), = jobs(load(REUSABLE))
+    expected = f"{caller_job} / {callee_job}"
+    main = json.loads((ROOT / "ci" / "rulesets" / "main.json").read_text())
+    checks = [r for r in main["rules"] if r["type"] == "required_status_checks"][0]["parameters"]["required_status_checks"]
+    assert checks == [{"context": expected, "integration_id": 15368}]          # 15368 = GitHub Actions
+    types = {r["type"] for r in main["rules"]}
+    assert {"deletion", "non_fast_forward", "pull_request", "required_status_checks"} <= types
+    assert all(b["bypass_mode"] == "pull_request" for b in main["bypass_actors"])  # no direct-push bypass
+    for path in RULESETS:
+        rs = json.loads(path.read_text())
+        assert rs["enforcement"] == "active" and rs["target"] in {"branch", "tag"}
+
+
+def test_new_workflow_files_pass_actionlint_and_zizmor():
+    files = [str(INSTALLED), str(SELF_CALLER)]
+    r = subprocess.run([_tool("actionlint"), "-no-color", *files], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
+                       text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr

@@ -1,0 +1,7 @@
+# Every change is routed to the owner; workflow and gate code most of all.
+*                     @asshat1981ar
+/.github/             @asshat1981ar
+/ci/                  @asshat1981ar
+/hooks/               @asshat1981ar
+/lifecycle/           @asshat1981ar
+/mcp_reference_monitor.py @asshat1981ar
