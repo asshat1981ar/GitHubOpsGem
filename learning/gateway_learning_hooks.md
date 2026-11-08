@@ -115,3 +115,15 @@ LESSONS (route: tool-patterns + this file):
    "capped", never toward "zero spent".
 3. Self-tests confirm the author's model of the world; an independent adversarial reviewer tests the world.
    Keep "fresh-eyes review for money, secrets, merges" as a non-optional step (now in state/SELF_PROMPT.md).
+
+## 8. Re-review of the WU-07 fixes (2026-11-08)
+
+All 10 original findings verified fixed by the same reviewer; two regressions found in the fix itself:
+- R1: LiteLLM retries reuse the call id, so "remember ended ids to ignore late starts" also ignored legitimate
+  retries and the idle rule could kill them mid-generation. LESSON: a dedupe rule must be keyed on what the
+  upstream actually guarantees (ids are per request, not per attempt); check the producer's retry semantics.
+- R2: billing the whole restart gap at the last replica count locked the B200 out for a week after a routine
+  uninstall/reinstall ($2,496 metered vs $0.45 billed). LESSON: "fail toward capped" still needs a bound when
+  the last known state proves the resource was already going down.
+Process: fixer and reviewer were different agents; the reviewer re-ran its own repros against the fix. Keep that
+pairing for anything that controls money.

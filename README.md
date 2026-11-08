@@ -1,19 +1,25 @@
-# gem-v5.6 — GitHubOpsGem work package (GC-007)
+# GitHubOpsGem v5.7 (GC-007)
 
 | Path | What |
 |---|---|
 | `mcp_reference_monitor.py` | gemcore v5.4 (v5.1 audit fixes, v5.2 unified-spec rules, v5.3 ForgeCore client, v5.4 shell-push coverage) |
-| `tests/` | 190 tests — `python3 -m pytest -q` (library, gemctl, hooks, installer, lifecycle controller) |
-| `gemctl.py` | CLI: `scan-diff`, `debt`, `gate`, `ci-window`, `strip`, `verify`, `heavy on/off/status`, `version`; JSON out, exit 2 = BLOCK |
-| `hooks/gem_pretool.py` | Claude Code PreToolUse gate for `git push`, `gh pr merge` and GitHub MCP writes |
+| `tests/` | 379 tests — `python3 -m pytest -q` (the deploy end-to-end tests need root) |
+| `gemctl.py` | CLI: `scan-diff`, `debt`, `gate`, `ci-window`, `strip`, `verify`, `heavy on/off/status`, `trailer add/note/verify/install-hook`, `version`; JSON out, exit 2 = BLOCK |
+| `gem_trailers.py` | `Gem-Gate:` commit trailers + `refs/notes/gem-gate` attestations, verified against ForgeCore (WU-09b) |
+| `hooks/gem_pretool.py` | Claude Code PreToolUse gate for `git push`, `gh pr merge` and GitHub MCP writes; always denies the model operating the B200 |
+| `hooks/gem_fileguard.py` | Fast stdlib guard: file tools never touch the B200 operator credentials |
 | `hooks/gem_session_start.py` | Tells each session its mode, flip date, ForgeCore reachability and B200 state; registers the session |
 | `hooks/gem_session_end.py` | Tells the lifecycle controller the session ended (B200 sleeps 45 s after the last one) |
 | `lifecycle/gem_lifecycle.py` | WU-07 controller (awsbox): wake/sleep, GPU-second meter, $26/day + $78/week caps, auto-delete guard; `dryrun` replays the gate |
 | `lifecycle/deploy_awsbox.sh` | One-command, idempotent install/upgrade/uninstall on awsbox (ShellCheck-clean, tested end to end) |
 | `lifecycle/gem-lifecycle.service`, `lifecycle/lifecycle.env.example` | systemd unit (hardened) and its environment file |
 | `gateway/gem_lifecycle_callback.py` | LiteLLM callback: ds-burst traffic keeps the B200 awake, ds-main 429 storms wake it |
+| `gateway/gem_guardrail.py` | LiteLLM guardrail: strips `<think>` from streamed and non-streamed output on `/v1/messages` and `/chat/completions` (WU-05) |
+| `.github/workflows/gem-review.yml`, `gem-review-pr.yml` | Reusable server-side review (scan-diff + debt, read-only, SHA-pinned) and this repo's own PR check |
+| `ci/rulesets/*.json`, `ci/apply_rulesets.sh` | Branch + tag rulesets; the owner applies them with `gh` |
+| `state/SELF_PROMPT.md` | Standing directive for autonomous runs (loop, guardrails, self-correction checklist) |
 | `gem_lifecycle_client.py` | Client used by `gemctl heavy` and the session hooks |
-| `install_hooks.py` | Installs into `~/.gem` and merges three hooks into `~/.claude/settings.json` (idempotent, backup, `--remove`) |
+| `install_hooks.py` | Installs into `~/.gem` and merges the hooks into `~/.claude/settings.json` (idempotent, backup, `--remove`) |
 | `probes.py` | 19 adversarial probes — `python3 -I probes.py <module.py>` |
 | `probe_results.json` / `probe_results_v5.2.json` | 19/19 defects on v5, 0/19 on v5.2+ |
 | `gateway/litellm_config.v7.yaml` | DRAFT gateway config: serverless-first, B200 burst, $10/day serverless budget (not yet run against LiteLLM) |
