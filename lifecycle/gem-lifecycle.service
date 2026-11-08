@@ -1,0 +1,40 @@
+# GitHubOpsGem B200 lifecycle controller (WU-07) — awsbox.
+# Install with:  sudo ./lifecycle/deploy_awsbox.sh      (idempotent; see --help)
+#   journalctl -u gem-lifecycle -f        # one JSON line per decision (scale, cap_tripped, check_failed, ...)
+#
+# If this service stops, nothing scales the B200 down except Fireworks' own scale-to-zero window, so keep that
+# window at 5m (the controller warns at startup when it is longer).
+
+[Unit]
+Description=GitHubOpsGem B200 lifecycle controller (wake/sleep + GPU spend caps)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gem
+Group=gem
+EnvironmentFile=/etc/gem/lifecycle.env
+ExecStart=/usr/bin/python3 -I /opt/gem/gem_lifecycle.py serve
+Restart=always
+RestartSec=5
+StateDirectory=gem
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
