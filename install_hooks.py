@@ -37,26 +37,32 @@ def hook_entries(gem_home: str) -> dict:
     pre = f'{py} "{os.path.join(gem_home, "hooks", "gem_pretool.py")}"'
     start = f'{py} "{os.path.join(gem_home, "hooks", "gem_session_start.py")}"'
     end = f'{py} "{os.path.join(gem_home, "hooks", "gem_session_end.py")}"'
+    files = f'{py} "{os.path.join(gem_home, "hooks", "gem_fileguard.py")}"'
     return {
-        "PreToolUse": {"matcher": "Bash|mcp__.*github.*",
-                       "hooks": [{"type": "command", "command": pre, "timeout": 15}]},
-        "SessionStart": {"hooks": [{"type": "command", "command": start, "timeout": 10}]},
-        "SessionEnd": {"hooks": [{"type": "command", "command": end, "timeout": 10}]},
+        "PreToolUse": [
+            {"matcher": "Bash|mcp__.*github.*", "hooks": [{"type": "command", "command": pre, "timeout": 15}]},
+            # stdlib-only guard so every file read stays fast: keeps the model off the B200 operator credentials
+            {"matcher": "Read|Grep|Glob|Edit|Write|NotebookEdit",
+             "hooks": [{"type": "command", "command": files, "timeout": 5}]},
+        ],
+        "SessionStart": [{"hooks": [{"type": "command", "command": start, "timeout": 10}]}],
+        "SessionEnd": [{"hooks": [{"type": "command", "command": end, "timeout": 10}]}],
     }
 
 
 def _owned(group: dict) -> bool:
     return any(MARK in str(h.get("command", "")) or "gem_pretool.py" in str(h.get("command", ""))
                or "gem_session_start.py" in str(h.get("command", ""))
-               or "gem_session_end.py" in str(h.get("command", "")) for h in group.get("hooks", []))
+               or "gem_session_end.py" in str(h.get("command", ""))
+               or "gem_fileguard.py" in str(h.get("command", "")) for h in group.get("hooks", []))
 
 
 def merge(settings: dict, gem_home: str, remove: bool = False) -> dict:
     hooks = settings.setdefault("hooks", {})
-    for event, entry in hook_entries(gem_home).items():
+    for event, entries in hook_entries(gem_home).items():
         groups = [g for g in hooks.get(event, []) if not _owned(g)]
         if not remove:
-            groups.append(entry)
+            groups.extend(entries)
         if groups:
             hooks[event] = groups
         else:
@@ -84,9 +90,10 @@ def main() -> int:
         return 0
 
     if not a.remove:
-        for sub, names in (("lib", ["mcp_reference_monitor.py", "gemctl.py", "gem_lifecycle_client.py"]),
+        for sub, names in (("lib", ["mcp_reference_monitor.py", "gemctl.py", "gem_lifecycle_client.py",
+                                    "gem_trailers.py"]),
                            ("hooks", ["hooks/gem_pretool.py", "hooks/gem_session_start.py",
-                                      "hooks/gem_session_end.py"])):
+                                      "hooks/gem_session_end.py", "hooks/gem_fileguard.py"])):
             os.makedirs(os.path.join(a.gem_home, sub), exist_ok=True)
             for n in names:
                 shutil.copy2(os.path.join(SRC, n), os.path.join(a.gem_home, sub, os.path.basename(n)))

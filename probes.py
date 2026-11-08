@@ -122,7 +122,7 @@ def _():
 def _():
     ds = m.DeepSeekProtocolSanitizer()
     tiers = {t: ds.route_and_check_circuit_breaker(t, 10, t)["target_model"] for t in ("Grep", "Glob", "Read")}
-    return any("YOUR_DEPLOYMENT" in str(v) for v in tiers.values()), json.dumps(tiers)
+    return any("/deployments/" in str(v) for v in tiers.values()), json.dumps(tiers)  # dedicated B200 tier
 
 
 @probe("P11", "DUR sensor penalises @Deprecated declarations and the supported headless CLI (`claude --print`)")

@@ -47,7 +47,7 @@ model_list:
       cache_read_input_token_cost: 0.000000006
       output_cost_per_token: 0.0000012
 
-  # Burst capacity: the dedicated 4xB200 deployment (YOUR_DEPLOYMENT). Billed per GPU-second while up,
+  # Burst capacity: the dedicated 4xB200 deployment. Billed per GPU-second while up,
   # so LiteLLM cost is 0 here on purpose; the lifecycle controller meters and caps it.
   - model_name: ds-burst
     litellm_params:

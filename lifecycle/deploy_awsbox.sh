@@ -7,7 +7,7 @@
 #   sudo ./lifecycle/deploy_awsbox.sh --uninstall [--purge [--force]]
 #
 # Options:
-#   --deployment accounts/<acct>/deployments/<id>   default: accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT
+#   --deployment accounts/<acct>/deployments/<id>   required on first install; later runs reuse the saved one
 #   --api-key-file PATH        read the Fireworks key from a file instead of prompting (never put it in argv)
 #   --autodelete-off           you created the deployment with --unused-auto-delete-duration 0
 #   --accept-autodelete-risk   you didn't (or don't know); wakes allowed, status shows the risk
@@ -24,7 +24,7 @@
 set -euo pipefail
 umask 027
 
-DEPLOYMENT="accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT"
+DEPLOYMENT=""
 MODE=""            # "", live, dry
 AUTODELETE=""      # "", off, risk
 API_KEY_FILE=""
@@ -251,8 +251,12 @@ fi
 step "1/7 Preflight"
 [[ -f "$PKG/lifecycle/gem_lifecycle.py" && -f "$HERE/gem-lifecycle.service" ]] \
   || die "run this from the unzipped gem package (missing lifecycle/gem_lifecycle.py)"
+if [[ -z "$DEPLOYMENT" ]]; then                       # later runs reuse the saved deployment
+  DEPLOYMENT="$(envget GEM_BURST_DEPLOYMENT 2>/dev/null || true)"
+  [[ "$DEPLOYMENT" == *YOUR_ACCOUNT* ]] && DEPLOYMENT=""
+fi
 [[ "$DEPLOYMENT" =~ ^accounts/[A-Za-z0-9_.-]+/deployments/[A-Za-z0-9_.-]+$ ]] \
-  || die "--deployment must look like accounts/<acct>/deployments/<id>"
+  || die "pass --deployment accounts/<acct>/deployments/<id> (needed on the first install)"
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
   || die "needs Python 3.9+ (found $("$PY" -V 2>&1)); zoneinfo is required for the cap periods"
 ok "$("$PY" -V) at $PY"
@@ -454,18 +458,24 @@ while IFS='|' read -r kind msg; do
 done < "$WORK/status.txt"
 
 # ----------------------------------------------------------------------------- 7. LiteLLM
-step "7/7 LiteLLM callback"
+step "7/7 LiteLLM callbacks"
+# The lifecycle feed, the think-strip guardrail (WU-05) and the gemcore library the guardrail imports.
+LITELLM_FILES=(gateway/gem_lifecycle_callback.py gateway/gem_guardrail.py mcp_reference_monitor.py)
 if [[ -n "$LITELLM_DIR" ]]; then
   [[ -d "$LITELLM_DIR" ]] || die "--litellm-dir $LITELLM_DIR is not a directory"
-  install -m 0644 "$PKG/gateway/gem_lifecycle_callback.py" "$LITELLM_DIR/gem_lifecycle_callback.py"
-  ok "copied gem_lifecycle_callback.py to $LITELLM_DIR"
-  if grep -qs "gem_lifecycle_callback.proxy_handler_instance" "$LITELLM_DIR"/*.yaml "$LITELLM_DIR"/*.yml; then
-    ok "LiteLLM config already lists the callback"
-  else
-    warn "add to litellm_settings in your config:  callbacks: gem_lifecycle_callback.proxy_handler_instance"
-  fi
+  for f in "${LITELLM_FILES[@]}"; do
+    install -m 0644 "$PKG/$f" "$LITELLM_DIR/$(basename "$f")"
+  done
+  ok "copied gem_lifecycle_callback.py, gem_guardrail.py and mcp_reference_monitor.py to $LITELLM_DIR"
+  for cb in gem_lifecycle_callback gem_guardrail; do
+    if grep -qs "${cb}.proxy_handler_instance" "$LITELLM_DIR"/*.yaml "$LITELLM_DIR"/*.yml; then
+      ok "LiteLLM config lists ${cb}"
+    else
+      warn "add ${cb}.proxy_handler_instance to litellm_settings.callbacks (see gateway/litellm_config.v7.yaml)"
+    fi
+  done
 else
-  warn "not copied (no --litellm-dir): put gateway/gem_lifecycle_callback.py next to your LiteLLM config"
+  warn "not copied (no --litellm-dir): put ${LITELLM_FILES[*]} next to your LiteLLM config"
 fi
 if [[ -z "$PREFIX" ]] && command -v docker >/dev/null 2>&1; then
   while read -r cid; do

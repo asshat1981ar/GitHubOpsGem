@@ -68,11 +68,11 @@ def test_periods_follow_local_midnight_and_monday():
 
 
 def test_config_from_env_strips_litellm_prefix_and_validates():
-    cfg = gl.Config.from_env({"GEM_BURST_MODEL": "openai/accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT",
+    cfg = gl.Config.from_env({"GEM_BURST_MODEL": "openai/accounts/example/deployments/b200",
                               "GEM_GPU_CAP_DAY_USD": "26", "GEM_GPU_CAP_WEEK_USD": "20"})
-    assert cfg.deployment == "accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT"
+    assert cfg.deployment == "accounts/example/deployments/b200"
     assert "weekly cap is below the daily cap" in cfg.validate()
-    assert gl.Config.from_env({"GEM_BURST_DEPLOYMENT": "YOUR_DEPLOYMENT"}).validate()[0].startswith("GEM_BURST_DEPLOYMENT")
+    assert gl.Config.from_env({"GEM_BURST_DEPLOYMENT": "b200"}).validate()[0].startswith("GEM_BURST_DEPLOYMENT")
 
 
 def _doc(**over):

@@ -213,7 +213,9 @@ def test_installer_is_idempotent_and_preserves_settings(tmp_path):
         assert r.returncode == 0, r.stderr
     s = json.loads(settings.read_text())
     pre = s["hooks"]["PreToolUse"]
-    assert s["model"] == "ds-main" and len(pre) == 2 and pre[0]["hooks"][0]["command"] == "echo mine"
+    assert s["model"] == "ds-main" and len(pre) == 3 and pre[0]["hooks"][0]["command"] == "echo mine"
+    assert [g["matcher"] for g in pre[1:]] == ["Bash|mcp__.*github.*", "Read|Grep|Glob|Edit|Write|NotebookEdit"]
+    assert (home / "lib" / "gem_trailers.py").exists() and (home / "hooks" / "gem_fileguard.py").exists()
     assert (home / "lib" / "mcp_reference_monitor.py").exists() and (home / "hooks" / "gem_pretool.py").exists()
     assert list(tmp_path.glob("settings.json.bak-*"))
     run([INSTALL, "--settings", str(settings), "--gem-home", str(home), "--remove"])
@@ -259,3 +261,24 @@ def test_read_only_lifecycle_and_unrelated_commands_pass(command, tmp_path):
                                      ("Edit", {"file_path": "/root/.gem/operator.token", "old_string": "a", "new_string": "b"})])
 def test_file_tools_cannot_touch_operator_credentials(tool, ti, tmp_path):
     assert decision(hook(tool, ti, mode="WARN", gem_home=tmp_path)) == "deny"
+
+
+FILEGUARD = os.path.join(ROOT, "hooks", "gem_fileguard.py")
+
+
+@pytest.mark.parametrize("tool,ti,denied", [
+    ("Read", {"file_path": "/home/u/.gem/operator.token"}, True),
+    ("Grep", {"pattern": "TOKEN", "path": "/etc/gem/lifecycle.env"}, True),
+    ("Glob", {"pattern": "**/operator.token"}, True),
+    ("Read", {"file_path": "/home/u/project/README.md"}, False),
+    ("Edit", {"file_path": "/home/u/project/x.py", "old_string": "a", "new_string": "b"}, False),
+])
+def test_fast_fileguard(tool, ti, denied):
+    r = run([FILEGUARD], stdin=json.dumps({"tool_name": tool, "tool_input": ti}))
+    assert r.returncode == 0
+    assert (decision(json.loads(r.stdout)) == "deny") if denied else r.stdout.strip() == ""
+
+
+def test_fileguard_stays_stdlib_only():
+    src = open(FILEGUARD).read()
+    assert "mcp_reference_monitor" not in src and "import gem" not in src
