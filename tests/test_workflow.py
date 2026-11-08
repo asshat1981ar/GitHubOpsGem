@@ -466,3 +466,36 @@ def test_new_workflow_files_pass_actionlint_and_zizmor():
     r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
                        text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_sim_scan_uses_pr_head_checkout_for_env_context(tmp_path, repo):
+    """gem-review gives scan-diff the PR-head checkout, so an env binding outside the hunk is seen.
+
+    Patch-only scans fail closed on `${{ env.X }}` with no visible binding (CodeRabbit 4506305087); in CI the
+    changed file is on disk in `target/`, so a safely bound X must not become a CRITICAL there.
+    """
+    filler = "".join(f"      - run: echo step{i}\n" for i in range(12))
+    base_wf = ("on: pull_request\nenv:\n  GREETING: hello\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n"
+               + filler)
+    repo.commit({".github/workflows/env.yml": base_wf}, "env workflow")
+    base = repo.git("rev-parse", "main")
+    repo.branch("pr")
+    head = repo.commit({".github/workflows/env.yml": base_wf + "      - run: echo \"${{ env.GREETING }}\"\n"},
+                       "use env")
+    sim = simulate(tmp_path, repo, head, base)
+    assert _exit_of(sim, "Scan each changed file (gemctl scan-diff)") == 0, sim["log"]
+    assert "CWE-94_WORKFLOW_INJECTION" not in _categories(sim), sim["results"]
+    assert not sim["failed"], sim["log"]
+
+
+def test_sim_scan_with_pr_head_checkout_still_flags_tainted_env(tmp_path, repo):
+    """Full-file context must keep an untrusted binding outside the hunk tainted."""
+    filler = "".join(f"      - run: echo step{i}\n" for i in range(12))
+    base_wf = ("on: issues\nenv:\n  TITLE: ${{ github.event.issue.title }}\njobs:\n  b:\n    runs-on: ubuntu-latest\n"
+               "    steps:\n" + filler)
+    repo.commit({".github/workflows/env.yml": base_wf}, "env workflow")
+    base = repo.git("rev-parse", "main")
+    repo.branch("pr")
+    head = repo.commit({".github/workflows/env.yml": base_wf + "      - run: echo \"${{ env.TITLE }}\"\n"}, "use env")
+    sim = simulate(tmp_path, repo, head, base)
+    assert "CWE-94_WORKFLOW_INJECTION" in _categories(sim), sim["log"]

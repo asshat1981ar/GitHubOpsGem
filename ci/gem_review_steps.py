@@ -27,7 +27,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$")
@@ -128,7 +128,8 @@ def cmd_diff(a: argparse.Namespace) -> int:
 
     has_tests = any(TEST_PATH_RE.search(f["path"]) for f in files)
     _dump(work / "results" / "diff.json", {
-        "schema": "gem-review/diff/v1", "base_input": base_input, "base": base, "merge_base": merge_base,
+        "schema": "gem-review/diff/v1", "repo": str(Path(a.repo).resolve()),
+        "base_input": base_input, "base": base, "merge_base": merge_base,
         "head": head, "has_tests": has_tests, "files": files})
     log(f"{len(files)} changed file(s) between merge base {merge_base[:12]} and head {head[:12]}")
     return 0
@@ -136,23 +137,27 @@ def cmd_diff(a: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- gemctl steps
 
-def _gemctl(gem: str, *args: str) -> subprocess.CompletedProcess:
-    script = Path(gem) / "gemctl.py"
+def _gemctl(gem: str, *args: str, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+    script = Path(gem).resolve() / "gemctl.py"
     if not script.is_file():
         raise StepError(f"gemctl.py not found in the gem checkout {json.dumps(gem)}")
     # -I: no PYTHONPATH / user site / cwd on sys.path; gemctl adds its own directory itself.
+    # cwd is the PR-head checkout when known: scan-diff then reads a changed workflow file there as
+    # context (only if it hashes to the patch's target blob). The file is parsed, never executed.
     return subprocess.run([sys.executable, "-I", str(script), *args], capture_output=True, text=True,
-                          timeout=TIMEOUT_S, check=False)
+                          timeout=TIMEOUT_S, check=False, cwd=cwd)
 
 
 def cmd_scan(a: argparse.Namespace) -> int:
     work = Path(a.work)
     manifest = _load(work / "results" / "diff.json")
+    head_dir = manifest.get("repo") if isinstance(manifest.get("repo"), str) and Path(manifest["repo"]).is_dir() else None
     by_sev = {s: 0 for s in SEVERITIES}
     out: List[Dict[str, Any]] = []
     for f in manifest["files"]:
         # --opt=value keeps a file named "-x" from being parsed as a flag.
-        proc = _gemctl(a.gem, "scan-diff", f"--path={f['path']}", f"--patch={work / f['patch']}")
+        proc = _gemctl(a.gem, "scan-diff", f"--path={f['path']}", f"--patch={(work / f['patch']).resolve()}",
+                       cwd=head_dir)
         if proc.returncode != 0:
             raise StepError(f"gemctl scan-diff failed on {json.dumps(f['path'])} with exit {proc.returncode}: "
                             f"{json.dumps(proc.stderr[-400:])}")
