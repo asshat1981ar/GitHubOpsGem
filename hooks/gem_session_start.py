@@ -30,15 +30,18 @@ def _hook_input() -> dict:
 
 
 def lifecycle_note(session_id: str) -> str:
-    """Register the session with the B200 controller (WU-07) and describe the burst tier in one clause."""
+    """Register the session with the B200 controller (WU-07) and describe the burst tier in one clause.
+
+    Uses the SESSION token only (GEM_LIFECYCLE_SESSION_TOKEN): it can register sessions and read status, not wake
+    the B200."""
     try:
         import gem_lifecycle_client as lc
     except ImportError:
         return ""
-    if not lc.configured():
+    if not lc.configured("session"):
         return ""
     try:
-        code, b = lc.call("POST", "/session/start", {"session_id": session_id}, timeout=2.0)
+        code, b = lc.call("POST", "/session/start", {"session_id": session_id}, timeout=2.0, role="session")
     except lc.LifecycleUnavailable:
         return " B200 controller unreachable: stay on ds-main (serverless)."
     if code != 200:
@@ -46,6 +49,8 @@ def lifecycle_note(session_id: str) -> str:
     cap = f"GPU spend today ${b.get('spend_day_usd')} of ${b.get('cap_day_usd')}"
     if b.get("wake_disabled"):
         return f" B200 burst disabled by its deployment guard ({cap}); use ds-main."
+    if b.get("capped") == "ledger":
+        return " B200 burst disabled until the weekly rollover (its spend ledger was lost); use ds-main."
     if b.get("capped"):
         return f" B200 burst capped for the {b['capped']} ({cap}); use ds-main."
     return f" B200 burst {b.get('b200')} ({cap}); ds-main is the default, the user runs `gemctl heavy on` for burst."

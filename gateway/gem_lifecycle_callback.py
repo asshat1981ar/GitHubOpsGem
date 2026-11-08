@@ -3,7 +3,8 @@
   litellm_settings:
     callbacks: gem_lifecycle_callback.proxy_handler_instance
 
-What it reports (to GEM_LIFECYCLE_URL, default http://127.0.0.1:8090, bearer GEM_LIFECYCLE_TOKEN):
+What it reports (to GEM_LIFECYCLE_URL, default http://127.0.0.1:8090, bearer GEM_LIFECYCLE_FEED_TOKEN, which may
+only call these two endpoints; GEM_LIFECYCLE_TOKEN is still accepted as a fallback for older setups):
   * ds-burst request start/end  -> POST /touch      (keeps the B200 awake while it is serving; idle clock)
   * ds-main / ds-fast 429       -> POST /signal/429 (three within two minutes wake the B200)
 
@@ -68,8 +69,12 @@ def status_code(exc: Any) -> Optional[int]:
     return None
 
 
+def _token() -> str:
+    return os.environ.get("GEM_LIFECYCLE_FEED_TOKEN") or os.environ.get("GEM_LIFECYCLE_TOKEN", "")
+
+
 def _post(path: str, body: dict) -> None:
-    token = os.environ.get("GEM_LIFECYCLE_TOKEN", "")
+    token = _token()
     if not token:
         return
     url = os.environ.get("GEM_LIFECYCLE_URL", "http://127.0.0.1:8090").rstrip("/") + path

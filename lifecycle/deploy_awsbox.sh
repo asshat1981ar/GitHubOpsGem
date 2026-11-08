@@ -4,7 +4,7 @@
 #   sudo ./lifecycle/deploy_awsbox.sh                 first install: DRY mode (logs decisions, never scales)
 #   sudo ./lifecycle/deploy_awsbox.sh --live          let it scale the deployment for real
 #   sudo ./lifecycle/deploy_awsbox.sh --dry           back to DRY mode
-#   sudo ./lifecycle/deploy_awsbox.sh --uninstall [--purge]
+#   sudo ./lifecycle/deploy_awsbox.sh --uninstall [--purge [--force]]
 #
 # Options:
 #   --deployment accounts/<acct>/deployments/<id>   default: accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT
@@ -14,8 +14,13 @@
 #   --fix-window               run `firectl deployment update <id> --scale-to-zero-window 5m` (as $SUDO_USER)
 #   --litellm-dir DIR          copy the LiteLLM callback next to your LiteLLM config
 #   --yes                      never prompt (CI / scripted runs)
+#   --force                    with --uninstall --purge: purge even if the B200 could not be confirmed asleep
 #
-# Run it from the unzipped gem package. It never prints the API key or the controller token.
+# --uninstall first asks the running controller to scale the B200 to zero and waits for Fireworks to confirm.
+# If it can't, it prints the firectl command to do it by hand, and --purge stops before deleting the env file
+# (it holds the Fireworks key) unless --force is given.
+#
+# Run it from the unzipped gem package. It never prints the API key or the controller tokens.
 set -euo pipefail
 umask 027
 
@@ -27,6 +32,7 @@ LITELLM_DIR=""
 FIX_WINDOW=0
 UNINSTALL=0
 PURGE=0
+FORCE=0
 YES=0
 
 PREFIX="${GEM_DEPLOY_PREFIX:-}"          # tests install into a scratch root
@@ -45,7 +51,8 @@ step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
 ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '%sdeploy_awsbox: %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
-usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+loud() { printf '  %s!!! %s%s\n' "$R$B" "$*" "$N" >&2; }
+usage() { awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --litellm-dir) LITELLM_DIR="${2:?--litellm-dir needs a path}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
+    --force) FORCE=1; shift ;;
     --yes|-y) YES=1; shift ;;
     -h|--help) usage 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage 2 ;;
@@ -66,16 +74,45 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "run with sudo"
+PY="$(command -v python3 || true)"
+[[ -n "$PY" ]] || die "python3 not found"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Edits KEY=VALUE lines in place (comments and unknown keys kept). Values arrive on stdin, never in argv.
 cat > "$WORK/envtool.py" <<'PY'
 import os, re, sys, tempfile
-cmd, path, key = sys.argv[1:4]
+cmd, path = sys.argv[1:3]
+lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+
+
+def write(out):
+    st = os.stat(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".lifecycle.env.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.chmod(tmp, st.st_mode & 0o7777)
+    os.replace(tmp, path)
+
+
+if cmd == "normalize":
+    # systemd reads "KEY=value   # note" as the value "value   # note": move such notes onto their own line.
+    out, moved = [], 0
+    for line in lines:
+        m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s#]*)[ \t]+#[ \t]?(.*)", line)
+        if m:
+            out += [("# " + m.group(3)).rstrip(), f"{m.group(1)}={m.group(2)}"]
+            moved += 1
+        else:
+            out.append(line)
+    if moved:
+        write(out)
+    print(moved)
+    sys.exit(0)
+key = sys.argv[3]
 if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
     sys.exit(f"bad key {key!r}")
-lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
 if cmd == "get":
     for line in lines:
         if line.startswith(key + "="):
@@ -95,28 +132,105 @@ for line in lines:
     out.append(line)
 if not done:
     out.append(f"{key}={val}")
-st = os.stat(path)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".lifecycle.env.")
-with os.fdopen(fd, "w", encoding="utf-8") as fh:
-    fh.write("\n".join(out) + "\n")
-os.chown(tmp, st.st_uid, st.st_gid)
-os.chmod(tmp, st.st_mode & 0o7777)
-os.replace(tmp, path)
+write(out)
 PY
 envget() { python3 -I "$WORK/envtool.py" get "$ENV_FILE" "$1"; }
 envset() { printf '%s' "$2" | python3 -I "$WORK/envtool.py" set "$ENV_FILE" "$1"; }
 envset_stdin() { python3 -I "$WORK/envtool.py" set "$ENV_FILE" "$1"; }
 
-# Runs a command as the gem user with only the controller's environment (what systemd will give it).
+# Loads the env file the way systemd's EnvironmentFile= does, then execs the command with only that environment.
+# Lines starting with # or ; are comments; everything after the first "=" is the value, verbatim (a trailing
+# "# note" included, unlike a shell). It refuses any value with whitespace or "#" instead of guessing.
+ENVEXEC="$(cat <<'PY'
+import os, sys
+path, argv = sys.argv[1], sys.argv[2:]
+env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/")}
+bad = []
+with open(path, encoding="utf-8") as fh:
+    for n, line in enumerate(fh.read().split("\n"), 1):
+        s = line.lstrip()
+        if not s or s[0] in "#;" or "=" not in s:
+            continue
+        key, val = s.split("=", 1)
+        key = key.strip()
+        if "#" in val or any(c.isspace() for c in val):
+            bad.append(f"{path}:{n}: {key}: the value contains whitespace or '#'. systemd would pass all of it "
+                       "to the controller; put comments on their own line")
+        env[key] = val
+if bad:
+    sys.stderr.write("\n".join(bad) + "\n")
+    sys.exit(78)
+if argv:
+    os.execvpe(argv[0], argv, env)
+PY
+)"
+# with_env runs as root, as_gem as the service user; both see exactly what systemd gives the service.
+with_env() { env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$STATE" "$PY" -I -c "$ENVEXEC" "$ENV_FILE" "$@"; }
 as_gem() {
-  # shellcheck disable=SC2016  # $0/$@ are expanded by the inner sh, on purpose
-  runuser -u gem -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$STATE" \
-    sh -c 'set -a; . "$0"; set +a; exec "$@"' "$ENV_FILE" "$@"
+  runuser -u gem -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$STATE" "$PY" -I -c "$ENVEXEC" "$ENV_FILE" "$@"
+}
+
+# Asks the running controller to scale the B200 to zero and waits until Fireworks reports desired replicas 0.
+sleep_b200() {
+  with_env "$PY" -I - <<'PY'
+import json, os, sys, time, urllib.error, urllib.request
+base = "http://" + os.environ.get("GEM_LIFECYCLE_BIND", "127.0.0.1:8090")
+tok = os.environ.get("GEM_LIFECYCLE_TOKEN", "")
+if not tok:
+    sys.exit("no GEM_LIFECYCLE_TOKEN (operator) in the env file")
+
+
+def call(method, path, body=None, timeout=10.0):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, {"error": exc.read()[:200].decode("utf-8", "replace")}
+
+
+try:
+    code, body = call("POST", "/heavy", {"on": False}, timeout=40.0)
+except OSError as exc:
+    sys.exit(f"controller unreachable at {base} ({exc})")
+if code >= 300:
+    sys.exit(f"the controller could not scale it down: HTTP {code} {body}")
+deadline = time.monotonic() + 30
+while True:
+    try:
+        _, st = call("GET", "/status")
+    except OSError:
+        st = {}
+    if st.get("desired") == 0:
+        print(f"B200 scaled to zero (Fireworks reports desired 0, replicas {st.get('replicas')})")
+        sys.exit(0)
+    if time.monotonic() > deadline:
+        sys.exit(f"Fireworks still reports {st.get('desired')} desired replica(s) after 30 s")
+    time.sleep(1)
+PY
 }
 
 # ----------------------------------------------------------------------------- uninstall
 if [[ $UNINSTALL -eq 1 ]]; then
   step "Removing the lifecycle controller"
+  if [[ -f "$ENV_FILE" ]]; then
+    DEP_NOW="$(envget GEM_BURST_DEPLOYMENT)"
+    DEP_NOW="${DEP_NOW:-$DEPLOYMENT}"
+    if sleep_b200 > "$WORK/sleep.txt" 2>&1; then
+      ok "$(tail -1 "$WORK/sleep.txt")"
+    else
+      loud "could not confirm the B200 is asleep: $(tail -1 "$WORK/sleep.txt")"
+      loud "once this controller is gone, nothing scales it down except Fireworks' scale-to-zero window."
+      loud "scale it to zero yourself:  firectl deployment scale ${DEP_NOW##*/} --replica-count 0"
+      if [[ $PURGE -eq 1 && $FORCE -eq 0 ]]; then
+        die "stopped before removing anything: --purge would delete $ENV_FILE and the Fireworks key in it. Scale the B200 down first, or re-run with --uninstall --purge --force"
+      fi
+    fi
+  else
+    warn "no $ENV_FILE, so the controller can't be asked to put the B200 to sleep; check it with firectl"
+  fi
   "$SYSTEMCTL" disable --now "$UNIT" >/dev/null 2>&1 || true
   rm -f "$UNIT_DIR/$UNIT" "$OPT/gem_lifecycle.py"
   "$SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
@@ -139,15 +253,13 @@ step "1/7 Preflight"
   || die "run this from the unzipped gem package (missing lifecycle/gem_lifecycle.py)"
 [[ "$DEPLOYMENT" =~ ^accounts/[A-Za-z0-9_.-]+/deployments/[A-Za-z0-9_.-]+$ ]] \
   || die "--deployment must look like accounts/<acct>/deployments/<id>"
-PY="$(command -v python3 || true)"
-[[ -n "$PY" ]] || die "python3 not found"
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
   || die "needs Python 3.9+ (found $("$PY" -V 2>&1)); zoneinfo is required for the cap periods"
 ok "$("$PY" -V) at $PY"
 if "$PY" -c 'from zoneinfo import ZoneInfo; ZoneInfo("America/Chicago")' 2>/dev/null; then
   ok "time zone data present (caps roll over at midnight America/Chicago)"
 else
-  warn "no tz data for America/Chicago: caps would roll over at UTC midnight (install the tzdata package)"
+  die "no tz data for America/Chicago: install the tzdata package (the controller refuses an unknown GEM_CAP_TZ)"
 fi
 if [[ -z "$PREFIX" ]]; then
   command -v "$SYSTEMCTL" >/dev/null && [[ -d /run/systemd/system ]] || die "systemd is not running on this host"
@@ -181,6 +293,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 chown root:gem "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
+MOVED="$("$PY" -I "$WORK/envtool.py" normalize "$ENV_FILE")"
+[[ "$MOVED" == "0" ]] || ok "moved $MOVED inline comment(s) in $ENV_FILE onto their own line (systemd keeps them in the value)"
 ok "controller $("$PY" -I "$OPT/gem_lifecycle.py" version) in $OPT; config $ENV_FILE (0640 root:gem)"
 
 # ----------------------------------------------------------------------------- 3. configuration
@@ -204,12 +318,15 @@ else
   ok "Fireworks API key kept"
 fi
 
-if [[ -z "$(envget GEM_LIFECYCLE_TOKEN)" ]]; then
-  "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))' | envset_stdin GEM_LIFECYCLE_TOKEN
-  ok "generated the controller bearer token (GEM_LIFECYCLE_TOKEN)"
-else
-  ok "controller bearer token kept"
-fi
+for pair in operator:GEM_LIFECYCLE_TOKEN feed:GEM_LIFECYCLE_FEED_TOKEN session:GEM_LIFECYCLE_SESSION_TOKEN; do
+  role="${pair%%:*}" var="${pair#*:}"
+  if [[ -z "$(envget "$var")" ]]; then
+    "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))' | envset_stdin "$var"
+    ok "generated the $role token ($var)"
+  else
+    ok "$role token kept ($var)"
+  fi
+done
 
 case "$MODE" in
   live) envset GEM_LIFECYCLE_DRY 0 ;;
@@ -237,6 +354,11 @@ if [[ "$(envget GEM_AUTODELETE_VERIFIED)" == "1" ]]; then ok "auto-delete: off (
 elif [[ "$(envget GEM_AUTODELETE_ACCEPT_RISK)" == "1" ]]; then warn "auto-delete: unknown, risk accepted (use the B200 at least weekly)"
 else warn "auto-delete: unconfirmed, so the controller will refuse every wake (re-run with --autodelete-off or --accept-autodelete-risk)"
 fi
+if ! with_env true 2> "$WORK/envlint.txt"; then
+  cat "$WORK/envlint.txt" >&2
+  die "$ENV_FILE has values systemd would pass on verbatim (see above); fix those lines and re-run"
+fi
+ok "$ENV_FILE reads cleanly as a systemd EnvironmentFile"
 
 # ----------------------------------------------------------------------------- 4. deployment check
 step "4/7 Deployment check (${DEPLOYMENT})"
@@ -360,21 +482,25 @@ if [[ -z "$PREFIX" ]]; then
   LITELLM_UNIT="$("$SYSTEMCTL" list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -i litellm | head -1 || true)"
 fi
 if [[ -n "$LITELLM_UNIT" ]]; then
-  warn "give LiteLLM the token: sudo systemctl edit $LITELLM_UNIT  → [Service] Environment=GEM_LIFECYCLE_TOKEN=<token>"
+  warn "give LiteLLM the feed token: sudo systemctl edit $LITELLM_UNIT  → [Service] Environment=GEM_LIFECYCLE_FEED_TOKEN=<feed token>"
   warn "  then: sudo systemctl restart $LITELLM_UNIT"
 else
-  warn "give LiteLLM's process GEM_LIFECYCLE_TOKEN=<token> in its environment, then restart it"
+  warn "give LiteLLM's process GEM_LIFECYCLE_FEED_TOKEN=<feed token> in its environment, then restart it"
 fi
 
 # ----------------------------------------------------------------------------- summary
 cat <<EOF
 
-${B}Done.${N} Show the token (for LiteLLM and Termux) with:
-  sudo grep '^GEM_LIFECYCLE_TOKEN=' $ENV_FILE | cut -d= -f2-
+${B}Done.${N} Three controller tokens, each only where it belongs (show one with
+  sudo grep '^GEM_LIFECYCLE_FEED_TOKEN=' $ENV_FILE | cut -d= -f2-):
+  GEM_LIFECYCLE_FEED_TOKEN     LiteLLM's environment (the callback: /touch, /signal/429)
+  GEM_LIFECYCLE_SESSION_TOKEN  Termux, exported (Claude Code hooks: sessions and status)
+  GEM_LIFECYCLE_TOKEN          operator (wake/sleep): Termux file ~/.gem/operator.token, mode 0600, never exported
 
 On Termux:
   ssh -N -L 8000:127.0.0.1:8000 -L 8080:127.0.0.1:8080 -L 8090:127.0.0.1:8090 awsbox &
-  export GEM_LIFECYCLE_TOKEN=<token>          # or add it to gateway/claude-gem.env
+  (umask 077; mkdir -p ~/.gem; cat > ~/.gem/operator.token)   # paste the operator token, Enter, Ctrl-D
+  export GEM_LIFECYCLE_SESSION_TOKEN=<session token>
   python3 install_hooks.py && source gateway/claude-gem.env && gem heavy status
 
 Logs:     journalctl -u gem-lifecycle -f      (one JSON line per decision)

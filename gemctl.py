@@ -16,7 +16,8 @@ Exit codes: 0 = ok / PASS / WARN, 2 = BLOCK or verification failed, 1 = usage or
   gemctl version
 
 `gemctl heavy on` exits 2 when the controller refuses (spend cap or deployment guard) and 3 when the B200 is
-still warming after --wait seconds; keep working on ds-main either way.
+still warming after --wait seconds; keep working on ds-main either way. `gemctl heavy` authenticates with the
+controller's operator token: GEM_LIFECYCLE_TOKEN if set, else $GEM_HOME/operator.token (default ~/.gem, mode 0600).
 """
 
 from __future__ import annotations
@@ -130,6 +131,9 @@ def cmd_verify(a: argparse.Namespace) -> int:
 
 def _refusal(body: dict) -> str:
     why = body.get("refused", "")
+    if why == "cap_ledger":
+        return (f"the GPU spend ledger on awsbox was lost, so wakes are refused until the weekly rollover "
+                f"({body.get('resets_at')}); check Fireworks billing")
     if why.startswith("cap_"):
         period = "today's" if why == "cap_day" else "this week's"
         return (f"{period} GPU cap is reached (${body.get('headroom_usd', 0)} left, a wake needs "
@@ -142,6 +146,14 @@ def _refusal(body: dict) -> str:
 def cmd_heavy(a: argparse.Namespace) -> int:
     import gem_lifecycle_client as lc
 
+    try:
+        if not lc.token("operator"):
+            sys.stderr.write(f"gemctl heavy needs the controller's operator token: put it in "
+                             f"{lc.operator_token_path()} (chmod 600) or set GEM_LIFECYCLE_TOKEN for this command\n")
+            return 1
+    except lc.TokenError as exc:
+        sys.stderr.write(f"gemctl heavy: {exc}\n")
+        return 1
     try:
         if a.action == "status":
             code, st = lc.call("GET", "/status")
@@ -180,8 +192,7 @@ def cmd_heavy(a: argparse.Namespace) -> int:
                          f"{int(st.get('idle_sleep_s') or 180)}s without requests.\n")
         return 0
     except lc.LifecycleUnavailable as exc:
-        sys.stderr.write(f"{exc}. Is the tunnel up (ssh -L 8090:127.0.0.1:8090 awsbox) and "
-                         "GEM_LIFECYCLE_TOKEN set?\n")
+        sys.stderr.write(f"{exc}. Is the tunnel up (ssh -L 8090:127.0.0.1:8090 awsbox)?\n")
         return 1
 
 

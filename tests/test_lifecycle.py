@@ -24,7 +24,9 @@ GEMCTL = os.path.join(ROOT, "gemctl.py")
 START = os.path.join(ROOT, "hooks", "gem_session_start.py")
 END = os.path.join(ROOT, "hooks", "gem_session_end.py")
 INSTALL = os.path.join(ROOT, "install_hooks.py")
-TOKEN = "test-token-0123456789"
+TOKEN = "test-token-0123456789"                 # operator
+FEED = "feed-token-0123456789"
+SESSION = "session-token-0123456789"
 
 
 # ---------------------------------------------------------------- gate scenarios (the WU-07 gate)
@@ -81,7 +83,8 @@ def _doc(**over):
 
 
 def _cfg(**over):
-    return dataclasses.replace(gl.Config(deployment="accounts/demo/deployments/b200", token=TOKEN), **over)
+    base = gl.Config(deployment="accounts/demo/deployments/b200", token=TOKEN, feed_token=FEED, session_token=SESSION)
+    return dataclasses.replace(base, **over)
 
 
 def test_check_flags_long_backstop_and_extra_replicas_as_warnings():
@@ -109,35 +112,107 @@ def test_check_reads_autodelete_from_firectl_when_api_lacks_it():
 
 # ---------------------------------------------------------------- persistence and failure handling
 
-def test_ledger_survives_restart_and_bills_unseen_gap_conservatively(tmp_path):
+def _mk(clock, fake, **over):
+    ctl = gl.Lifecycle(_cfg(**over), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    ctl.recheck()
+    return ctl
+
+
+def _usd(gpu_s):
+    return gpu_s * 13 / 3600
+
+
+def test_restart_bills_the_whole_gap_at_the_saved_replica_count(tmp_path):
     state = str(tmp_path / "lifecycle.json")
     clock = gl.FakeClock(gl.SIM_START)
     fake = gl.FakeFireworks(clock, cold_start_s=0)
-    cfg = _cfg(state_path=state)
-    a = gl.Lifecycle(cfg, fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
-    a.recheck()
+    a = _mk(clock, fake, state_path=state)
     a.wake("heavy")
     for _ in range(4):
         clock.advance(15)
         a.tick()
     spent = a.spend()[0]
-    assert spent > 0
+    assert spent > 0 and json.load(open(state))["replicas"] == 1
     clock.advance(7200)                                   # controller down for 2 h while the GPU stays up
-    b = gl.Lifecycle(cfg, fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
+    b = gl.Lifecycle(a.cfg, fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
     assert b.spend()[0] == pytest.approx(spent)
     b.tick()
-    gap_usd = cfg.max_gap_s * 4 * cfg.gpu_rate_usd_per_hour / 3600
-    assert b.spend()[0] == pytest.approx(spent + gap_usd)
-    assert b.unmetered_gap_s == pytest.approx(3600) and any(e["event"] == "unmetered_gap" for e in b.events)
+    assert b.spend()[0] == pytest.approx(spent + _usd(7200 * 4))          # all of it, no max_gap_s cap
+    ev = [e for e in b.events if e["event"] == "restart_gap_billed"]
+    assert ev and ev[0]["seconds"] == 7200 and ev[0]["usd"] == pytest.approx(104.0)
+    assert "unmetered_gap_s" not in b.status() and not hasattr(b, "unmetered_gap_s")
 
 
-def test_corrupt_state_is_moved_aside(tmp_path):
-    state = tmp_path / "lifecycle.json"
-    state.write_text("{not json")
-    ctl = gl.Lifecycle(_cfg(state_path=str(state)), gl.FakeFireworks(gl.FakeClock(gl.SIM_START)),
+def test_restart_bills_the_gap_even_when_fireworks_drained_it_meanwhile(tmp_path):
+    state = str(tmp_path / "s.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = _mk(clock, fake, state_path=state)
+    a.set_heavy(True)
+    for _ in range(4):
+        clock.advance(15)
+        a.tick()
+    clock.advance(1800)                                   # down 30 min with the GPU billing ...
+    fake.scale(0)                                         # ... then Fireworks' backstop drains it
+    clock.advance(60)
+    b = _mk(clock, fake, state_path=state)
+    b.tick()
+    assert b.spend()[0] >= _usd(fake.billed_gpu_s)        # was ~$26 short before the fix
+    assert [e for e in b.events if e["event"] == "restart_gap_billed"][0]["replicas"] == 1
+
+
+def test_save_fsyncs_file_then_directory(tmp_path, monkeypatch):
+    seen = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(gl.os, "fsync", lambda fd: (seen.append(("fsync", "dir" if __import__("stat").S_ISDIR(
+        os.fstat(fd).st_mode) else "file")), real_fsync(fd))[1])
+    monkeypatch.setattr(gl.os, "replace", lambda a, b: (seen.append(("replace",)), real_replace(a, b))[1])
+    ctl = gl.Lifecycle(_cfg(state_path=str(tmp_path / "s.json")), gl.FakeFireworks(gl.FakeClock(gl.SIM_START)),
                        clock=gl.FakeClock(gl.SIM_START), out=io.StringIO())
-    assert not state.exists() and any(p.name.startswith("lifecycle.json.corrupt-") for p in tmp_path.iterdir())
-    assert ctl.events[-1]["event"] == "state_unreadable"
+    ctl._save()
+    assert seen == [("fsync", "file"), ("replace",), ("fsync", "dir")]
+
+
+@pytest.mark.parametrize("content", ["", "{not json", "[]", '{"version": 2}', '{"gpu_seconds": {"day:x": "lots"}}'])
+def test_damaged_ledger_refuses_wakes_until_the_weekly_rollover(tmp_path, content):
+    state = tmp_path / "lifecycle.json"
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = _mk(clock, fake, state_path=str(state))
+    gl._preload(a, 25.9, 77.9)
+    a._save()
+    state.write_text(content)                             # e.g. zero-length after a crash before fsync
+    b = _mk(clock, fake, state_path=str(state))
+    assert any(p.name.startswith("lifecycle.json.corrupt-") for p in tmp_path.iterdir())
+    assert any(e["event"] == "state_unreadable" for e in b.events)
+    code, body = b.wake("heavy")
+    rollover = gl.next_rollover(clock.now, "America/Chicago", "week")
+    assert code == 409 and body["refused"] == "cap_ledger" and body["resets_at"] == gl.iso(rollover)
+    st = b.status()
+    assert st["ledger_lost_until"] == gl.iso(rollover) and st["capped"] == "ledger" and st["binding_cap"] == "ledger"
+    assert fake.calls == []
+    c = _mk(clock, fake, state_path=str(state))           # persisted: another restart still refuses
+    assert c.wake("heavy")[0] == 409
+    clock.advance(rollover - clock.now + 1)
+    assert c.wake("heavy")[0] == 202 and c.status()["ledger_lost_until"] is None
+
+
+def test_damaged_ledger_scales_down_a_running_gpu(tmp_path):
+    state = tmp_path / "s.json"
+    state.write_text("")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    fake.scale(1)
+    ctl = _mk(clock, fake, state_path=str(state))
+    clock.advance(15)
+    ctl.tick()
+    assert fake.desired == 0 and ctl.scale_calls[-1][2] == "cap_ledger"
+
+
+def test_missing_ledger_is_a_first_install_at_zero(tmp_path):
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock), state_path=str(tmp_path / "new" / "lifecycle.json"))
+    assert ctl.ledger_lost_until is None and ctl.wake("heavy")[0] == 202
 
 
 class FlakyFireworks(gl.FakeFireworks):
@@ -190,10 +265,11 @@ def test_session_end_sleep_skipped_when_another_session_is_still_sending():
     fake = gl.FakeFireworks(clock, cold_start_s=0)
     ctl = gl.Lifecycle(_cfg(), fake, clock=clock, out=io.StringIO(), firectl=lambda _d: None)
     ctl.recheck()
+    ctl.session_start("A")
     ctl.wake("heavy")
     clock.advance(15)
     ctl.tick()
-    ctl.session_end("unknown-after-restart")              # registry was lost; a live session keeps sending
+    ctl.session_end("A")                                  # A ends, but an unregistered client keeps sending
     clock.advance(20)
     ctl.touch("start", "c1")
     ctl.touch("end", "c1")
@@ -244,9 +320,11 @@ class LiveController:
         self.stop.set()
         self.srv.shutdown()
 
-    def env(self):
+    def env(self, role="operator"):
         e = {k: v for k, v in os.environ.items() if not k.startswith(("GEM_", "AUTODEV_"))}
-        e.update(GEM_LIFECYCLE_URL=self.url, GEM_LIFECYCLE_TOKEN=TOKEN)
+        e.update(GEM_LIFECYCLE_URL=self.url, GEM_HOME=os.path.join(ROOT, "no-such-gem-home"))
+        e[{"operator": "GEM_LIFECYCLE_TOKEN", "session": "GEM_LIFECYCLE_SESSION_TOKEN"}[role]] = \
+            {"operator": TOKEN, "session": SESSION}[role]
         return e
 
 
@@ -337,11 +415,11 @@ def test_gemctl_heavy_unreachable_controller():
 def test_session_hooks_register_and_schedule_sleep(live):
     live.ctl.wake("heavy")
     r = subprocess.run([PY, START], input=json.dumps({"session_id": "s-1", "source": "startup"}),
-                       capture_output=True, text=True, env=live.env(), timeout=30)
+                       capture_output=True, text=True, env=live.env("session"), timeout=30)
     assert r.returncode == 0 and "B200 burst" in r.stdout and "of $26.0" in r.stdout
     assert "s-1" in live.ctl.sessions
     r = subprocess.run([PY, END], input=json.dumps({"session_id": "s-1", "reason": "exit"}),
-                       capture_output=True, text=True, env=live.env(), timeout=30)
+                       capture_output=True, text=True, env=live.env("session"), timeout=30)
     assert r.returncode == 0 and r.stdout == ""
     assert live.ctl.sessions == {} and live.ctl.sleep_reason == "session_end"
 
@@ -350,7 +428,7 @@ def test_session_hooks_are_silent_without_controller():
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GEM_", "AUTODEV_"))}
     r = subprocess.run([PY, START], input="{}", capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0 and "B200" not in r.stdout
-    env.update(GEM_LIFECYCLE_URL="http://127.0.0.1:9", GEM_LIFECYCLE_TOKEN=TOKEN)
+    env.update(GEM_LIFECYCLE_URL="http://127.0.0.1:9", GEM_LIFECYCLE_SESSION_TOKEN=SESSION)
     r = subprocess.run([PY, START], input="{}", capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0 and "controller unreachable" in r.stdout
     r = subprocess.run([PY, END], input="{}", capture_output=True, text=True, env=env, timeout=30)
@@ -378,7 +456,8 @@ def test_installer_adds_session_end_and_copies_client(tmp_path):
 
 def _load_callback(monkeypatch, live):
     monkeypatch.setenv("GEM_LIFECYCLE_URL", live.url)
-    monkeypatch.setenv("GEM_LIFECYCLE_TOKEN", TOKEN)
+    monkeypatch.delenv("GEM_LIFECYCLE_TOKEN", raising=False)
+    monkeypatch.setenv("GEM_LIFECYCLE_FEED_TOKEN", FEED)
     monkeypatch.setenv("GEM_LIFECYCLE_SYNC", "1")
     import gem_lifecycle_callback
     return importlib.reload(gem_lifecycle_callback)
@@ -563,3 +642,477 @@ def test_status_reports_autodelete_mode_and_idle_days():
     clock.advance(3 * 86400)
     st = ctl.status()
     assert st["auto_delete"] == "risk accepted" and st["days_since_b200_traffic"] == 3.0 and not st["wake_disabled"]
+
+
+# ---------------------------------------------------------------- review hardening (WU-07h)
+
+# Finding 1: systemd keeps inline comments in EnvironmentFile values.
+
+def test_config_tolerates_inline_comments_that_systemd_keeps():
+    cfg = gl.Config.from_env({
+        "GEM_BURST_DEPLOYMENT": "accounts/a/deployments/b",
+        "GEM_GPU_RATE_USD_PER_HOUR": "13.0          # ASSUMPTION: confirm on fireworks.ai/pricing",
+        "GEM_CAP_TZ": "America/Chicago              # days and Monday-start weeks roll over in this zone",
+        "GEM_IDLE_SLEEP_S": "180\t# after the last request", "GEM_429_WAKE_COUNT": "3 # n"})
+    assert (cfg.gpu_rate_usd_per_hour, cfg.tz, cfg.idle_sleep_s, cfg.storm_count) == (13.0, "America/Chicago", 180.0, 3)
+    assert cfg.validate() == []
+
+
+def test_validate_rejects_unknown_time_zone_and_bad_numbers():
+    errs = gl.Config.from_env({"GEM_BURST_DEPLOYMENT": "accounts/a/deployments/b", "GEM_CAP_TZ": "America/Chicgo",
+                               "GEM_POLL_S": "fast"}).validate()
+    assert any("GEM_CAP_TZ" in e for e in errs) and any("GEM_POLL_S" in e for e in errs)
+    assert gl.Config.from_env({"GEM_BURST_DEPLOYMENT": "accounts/a/deployments/b", "GEM_CAP_TZ": "UTC"}).validate() == []
+
+
+def test_serve_reports_a_bad_value_instead_of_crashing():
+    env = {"PATH": os.environ["PATH"], "GEM_BURST_DEPLOYMENT": "accounts/a/deployments/b", "FIREWORKS_API_KEY": "k",
+           "GEM_LIFECYCLE_TOKEN": TOKEN, "GEM_POLL_S": "fast"}
+    r = subprocess.run([PY, "-I", os.path.join(ROOT, "lifecycle", "gem_lifecycle.py"), "serve"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1 and "GEM_POLL_S must be a number" in r.stderr and "Traceback" not in r.stderr
+
+
+# Finding 5: a wake during a drain was reported as ready and then lost.
+
+class SlowDrain(gl.FakeFireworks):
+    def scale(self, n):
+        super().scale(n)
+        if n == 0:
+            self._slow_down_at = self.clock() + 40
+
+    def _physics(self):
+        now = self.clock()
+        self.billed_gpu_s += (now - self._last) * self.replicas * self.gpus
+        self._last = now
+        if self.desired > self.replicas and self._up_at is not None and now >= self._up_at:
+            self.replicas = self.desired
+        if self.desired < self.replicas and now >= getattr(self, "_slow_down_at", 0):
+            self.replicas = self.desired
+
+
+def test_wake_during_drain_scales_back_up():
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = SlowDrain(clock, cold_start_s=0)
+    ctl = _mk(clock, fake)
+    ctl.set_heavy(True)
+    clock.advance(15)
+    ctl.tick()
+    ctl.set_heavy(False)
+    clock.advance(5)
+    assert ctl.status()["burst_ready"] is False            # draining: replicas 1, desired 0
+    code, _ = ctl.set_heavy(True)
+    assert code == 202 and fake.desired == 1 and ctl.scale_calls[-1][1] == 1
+    for _ in range(4):
+        clock.advance(15)
+        ctl.tick()
+    assert fake.replicas == 1 and ctl.heavy and ctl.status()["burst_ready"] is True
+
+
+# Finding 6: restarts dropped in-flight requests and sessions; a transient startup check killed a resumed run.
+
+def test_restart_mid_request_keeps_the_gpu_for_the_running_generation(tmp_path):
+    state = str(tmp_path / "s.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = _mk(clock, fake, state_path=state)
+    a.set_heavy(True)
+    clock.advance(15)
+    a.tick()
+    a.touch("start", "long")                              # an 8-minute generation starts
+    clock.advance(60)
+    b = _mk(clock, fake, state_path=state)                # e.g. deploy_awsbox.sh --live restarts the unit
+    assert "long" in b.inflight
+    for _ in range(16):
+        clock.advance(15)
+        b.tick()
+    assert fake.replicas == 1 and not [c for c in b.scale_calls if c[1] == 0]
+
+
+def test_restart_keeps_sessions_so_an_unrelated_session_end_does_not_sleep(tmp_path):
+    state = str(tmp_path / "s.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = _mk(clock, fake, state_path=state)
+    a.session_start("A")
+    a.session_start("B")
+    a.set_heavy(True)
+    clock.advance(15)
+    a.tick()
+    a.touch("start", "c")
+    a.touch("end", "c")
+    clock.advance(5)
+    b = _mk(clock, fake, state_path=state)
+    b.tick()
+    assert set(b.sessions) == {"A", "B"}
+    b.session_end("B")                                    # B was a ds-main-only session; A is still reading
+    for _ in range(4):
+        clock.advance(15)
+        b.tick()
+    assert fake.replicas == 1 and b.sleep_at is None
+
+
+def test_unknown_session_end_schedules_nothing():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock, cold_start_s=0))
+    ctl.set_heavy(True)
+    code, body = ctl.session_end("never-registered")
+    assert code == 200 and body["known"] is False and ctl.sleep_at is None
+
+
+def test_persisted_leases_and_sessions_expire_on_reload(tmp_path):
+    state = str(tmp_path / "s.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock)
+    a = _mk(clock, fake, state_path=state)
+    a.touch("start", "old")
+    a.session_start("old-session")
+    clock.advance(700)                                    # beyond the 660 s lease
+    a.touch("start", "new")
+    clock.advance(13 * 3600)                              # beyond the 12 h session TTL
+    a.session_start("new-session")
+    b = _mk(clock, fake, state_path=state)
+    assert set(b.sessions) == {"new-session"} and set(b.inflight) == set()
+    clock.advance(1)
+    b.touch("start", "fresh")
+    c = _mk(clock, fake, state_path=state)
+    assert set(c.inflight) == {"fresh"}
+
+
+class FlakyOnce(gl.FakeFireworks):
+    n = 0
+
+    def get(self):
+        self.n += 1
+        if self.n == 1:
+            raise gl.FireworksError("GET: timed out")
+        return super().get()
+
+
+def _running_heavy(tmp_path):
+    state = str(tmp_path / "s.json")
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    a = _mk(clock, fake, state_path=state)
+    a.set_heavy(True)
+    clock.advance(15)
+    a.tick()
+    a.touch("start", "c")
+    a.touch("end", "c")
+    clock.advance(10)
+    return state, clock
+
+
+def test_transient_startup_check_does_not_kill_a_resumed_run(tmp_path):
+    state, clock = _running_heavy(tmp_path)
+    flaky = FlakyOnce(clock, cold_start_s=0)
+    flaky.replicas = flaky.desired = 1
+    b = _mk(clock, flaky, state_path=state)               # the startup GET times out
+    assert b.report.info.get("transient") and b.wake_disabled
+    clock.advance(1)
+    b.tick()
+    assert flaky.desired == 1 and b.wake_reason == "heavy" and not [c for c in b.scale_calls if c[1] == 0]
+    assert any(e["event"] == "resumed" for e in b.events)
+
+
+def test_hard_startup_check_failure_still_stops_a_resumed_run(tmp_path):
+    state, clock = _running_heavy(tmp_path)
+    bad = gl.FakeFireworks(clock, cold_start_s=0, extra={"unusedAutoDeleteDuration": "604800s"})
+    bad.replicas = bad.desired = 1
+    b = _mk(clock, bad, state_path=state)
+    clock.advance(1)
+    b.tick()
+    assert bad.desired == 0 and b.scale_calls[-1][2] == "guard"
+
+
+# Finding 7: a start that arrives after its end held the GPU for the whole lease.
+
+def test_touch_requires_a_call_id():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock))
+    assert ctl.touch("start", "")[0] == 400 and ctl.touch("end", "")[0] == 400
+    assert ctl.inflight == {} and ctl.last_traffic is None
+
+
+def test_late_start_after_its_end_is_ignored():
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    ctl = _mk(clock, fake)
+    ctl.set_heavy(True)
+    clock.advance(15)
+    ctl.tick()
+    ctl.touch("end", "x")                                  # two daemon threads, delivered out of order
+    code, body = ctl.touch("start", "x")
+    assert code == 200 and body.get("ignored") and ctl.inflight == {}
+    t0 = clock.now
+    while fake.replicas and clock.now - t0 < 3600:
+        clock.advance(15)
+        ctl.tick()
+    assert clock.now - t0 < 200                            # was ~1095 s with a 900 s lease
+
+
+def test_recently_ended_ids_are_bounded_and_expire():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock))
+    for i in range(600):
+        ctl.touch("end", f"c{i}")
+    assert len(ctl.ended) == gl.ENDED_KEEP and "c0" not in ctl.ended and "c599" in ctl.ended
+    assert ctl.touch("start", "c0")[1].get("ignored") is None          # forgotten, so it counts again
+    clock.advance(2 * ctl.cfg.request_lease_s + 1)
+    ctl.tick()
+    assert not ctl.ended
+
+
+def test_request_lease_is_configurable():
+    assert gl.Config.from_env({}).request_lease_s == 660.0
+    assert gl.Config.from_env({"GEM_REQUEST_LEASE_S": "120"}).request_lease_s == 120.0
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock), request_lease_s=120.0)
+    ctl.touch("start", "c")
+    clock.advance(121)
+    ctl.tick()
+    assert ctl.inflight == {} and any(e["event"] == "lease_expired" for e in ctl.events)
+
+
+# Finding 8: HTTP input handling.
+
+def _raw(url, request: bytes, wait=3.0):
+    import socket
+    host, port = url.rsplit(":", 1)
+    with socket.create_connection((host.split("//")[1], int(port)), timeout=wait) as s:
+        s.sendall(request)
+        try:
+            return s.recv(200)
+        except socket.timeout:
+            return b"<no response>"
+
+
+def test_http_rejects_bad_numbers_flags_and_lengths(live):
+    for raw in (b'{"delay_s": NaN}', b'{"delay_s": Infinity}', b'{"delay_s": -Infinity}', b'{"delay_s": true}'):
+        assert _http(live.url + "/sleep", "POST", raw=raw)[0] == 400, raw
+    assert _http(live.url + "/status")[0] == 200 and live.ctl.sleep_at is None
+    code, body = _http(live.url + "/sleep", "POST", {"delay_s": 1e12})
+    assert code == 202 and live.ctl.sleep_at - time.time() <= gl.MAX_DELAY_S + 5
+    assert _http(live.url + "/sleep", "POST", {"delay_s": -5})[1] == {"ok": True, "sleeping": "now"}
+    for on in ("false", "true", 1, 0, None):
+        assert _http(live.url + "/heavy", "POST", {"on": on})[0] == 400, on
+    assert live.fake.desired == 0
+    auth = f"Authorization: Bearer {TOKEN}\r\n".encode()
+    for length in (b"-1", b"abc", b"1e3"):
+        resp = _raw(live.url, b"POST /touch HTTP/1.1\r\nHost: x\r\n" + auth + b"Content-Length: " + length +
+                    b"\r\n\r\n" + b"A" * 1000)
+        assert resp.startswith(b"HTTP/1.0 400"), (length, resp)
+
+
+def test_http_client_timeout_releases_stalled_connections(live):
+    handler = live.srv.RequestHandlerClass
+    assert handler.timeout == 5
+    handler.timeout = 0.3
+    import socket
+    host, port = live.url.split("//")[1].split(":")
+    with socket.create_connection((host, int(port)), timeout=3) as s:
+        s.sendall(b"GET /status HTTP/1.1\r\n")          # never finishes the request
+        start = time.time()
+        assert s.recv(100) == b"" and time.time() - start < 2.5
+
+
+def test_sessions_and_inflight_are_capped(monkeypatch):
+    monkeypatch.setattr(gl, "MAX_TRACKED", 3)
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock))
+    assert [ctl.session_start(f"s{i}")[0] for i in range(4)] == [200, 200, 200, 429]
+    assert ctl.session_start("s0")[0] == 200                # refreshing a known session is fine
+    assert [ctl.touch("start", f"c{i}")[0] for i in range(4)] == [200, 200, 200, 429]
+    ctl.touch("end", "c0")
+    assert ctl.touch("start", "c9")[0] == 200
+
+
+# Finding 9: wall-clock steps.
+
+def _idle_run_after_step(step_s):
+    clock = gl.FakeClock(gl.SIM_START)
+    fake = gl.FakeFireworks(clock, cold_start_s=0)
+    ctl = _mk(clock, fake)
+    ctl.set_heavy(True)
+    clock.advance(15)
+    ctl.tick()
+    ctl.touch("start", "x")
+    ctl.touch("end", "x")
+    before = sum(v for k, v in ctl.gpu_seconds.items() if k.startswith("day:"))
+    clock.now += step_s                                    # NTP step: wall moves, the monotonic clock does not
+    elapsed = 0
+    while fake.desired and elapsed < 7200:
+        clock.advance(15)
+        elapsed += 15
+        ctl.tick()
+    metered = sum(v for k, v in ctl.gpu_seconds.items() if k.startswith("day:")) - before
+    return ctl, elapsed, metered
+
+
+@pytest.mark.parametrize("step_s", [-3600, 3600])
+def test_clock_step_neither_moves_the_idle_sleep_nor_bills_the_step(step_s):
+    ctl, elapsed, metered = _idle_run_after_step(step_s)
+    assert 180 <= elapsed <= 195                           # idle sleep 180 s after the last request, real time
+    assert metered == pytest.approx(elapsed * 4)           # GPU-seconds for the real time only, 4 GPUs
+    assert [e for e in ctl.events if e["event"] == "clock_step"][0]["step_s"] == step_s
+
+
+def test_clock_step_moves_every_timer():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock))
+    ctl.session_start("s")
+    ctl.touch("start", "c")
+    ctl.touch("end", "d")
+    ctl.signal_429("ds-main")
+    ctl.sleep(45, "manual")
+    snap = (dict(ctl.sessions), dict(ctl.inflight), dict(ctl.ended), list(ctl.storm), ctl.sleep_at, ctl.last_traffic)
+    clock.now -= 3600
+    ctl.status()
+    assert dict(ctl.sessions) == {k: v - 3600 for k, v in snap[0].items()}
+    assert dict(ctl.inflight) == {k: v - 3600 for k, v in snap[1].items()}
+    assert dict(ctl.ended) == {k: v - 3600 for k, v in snap[2].items()}
+    assert list(ctl.storm) == [t - 3600 for t in snap[3]]
+    assert (ctl.sleep_at, ctl.last_traffic) == (snap[4] - 3600, snap[5] - 3600)
+
+
+# Finding 10: one token per role.
+
+def test_role_tokens_limit_each_caller_to_its_endpoints(live):
+    calls = {"status": ("GET", "/status", None), "wake": ("POST", "/wake", {}),
+             "sleep": ("POST", "/sleep", {"delay_s": 600}), "heavy": ("POST", "/heavy", {"on": False}),
+             "check": ("POST", "/check", {}), "s_start": ("POST", "/session/start", {"session_id": "s"}),
+             "s_end": ("POST", "/session/end", {"session_id": "s"}),
+             "touch": ("POST", "/touch", {"event": "end", "call_id": "c"}),
+             "429": ("POST", "/signal/429", {"model_group": "ds-main"})}
+    allowed = {TOKEN: set(calls), FEED: {"touch", "429"}, SESSION: {"status", "s_start", "s_end"}}
+    for tok, ok in allowed.items():
+        for name, (method, path, body) in calls.items():
+            code = _http(live.url + path, method, body, token=tok)[0]
+            assert (code not in (401, 403)) == (name in ok), (tok, name, code)
+            if name not in ok:
+                assert code == 403, (tok, name, code)
+    assert _http(live.url + "/touch", "POST", {"event": "end", "call_id": "c"}, token="x" * 24)[0] == 401
+    assert live.fake.desired == 0                          # nobody but the operator woke it
+
+
+def test_a_missing_role_token_disables_that_role():
+    lc = LiveController(feed_token="", session_token="")
+    try:
+        assert _http(lc.url + "/touch", "POST", {"event": "end", "call_id": "c"}, token=FEED)[0] == 401
+        assert _http(lc.url + "/status", token=SESSION)[0] == 401
+        assert _http(lc.url + "/status", token="")[0] == 401
+        assert _http(lc.url + "/status")[0] == 200
+    finally:
+        lc.close()
+    env = {"PATH": os.environ["PATH"], "GEM_BURST_DEPLOYMENT": "accounts/a/deployments/b", "FIREWORKS_API_KEY": "k",
+           "GEM_LIFECYCLE_FEED_TOKEN": FEED}
+    r = subprocess.run([PY, "-I", os.path.join(ROOT, "lifecycle", "gem_lifecycle.py"), "serve"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1 and "GEM_LIFECYCLE_TOKEN (operator) must be set" in r.stderr
+
+
+def test_role_tokens_must_be_distinct():
+    assert any("must differ" in e for e in _cfg(session_token=TOKEN).validate())
+    assert any("at least 16" in e for e in _cfg(feed_token="short").validate())
+    assert _cfg().validate() == []
+
+
+def test_callback_uses_the_feed_token_with_operator_fallback(monkeypatch, live):
+    cb = _load_callback(monkeypatch, live)
+    monkeypatch.setenv("GEM_LIFECYCLE_TOKEN", TOKEN)
+    assert cb._token() == FEED
+    monkeypatch.delenv("GEM_LIFECYCLE_FEED_TOKEN")
+    assert cb._token() == TOKEN
+
+
+def test_session_hooks_never_use_the_operator_token(live):
+    r = subprocess.run([PY, START], input=json.dumps({"session_id": "s-op"}), capture_output=True, text=True,
+                       env=live.env("operator"), timeout=30)
+    assert r.returncode == 0 and "B200" not in r.stdout and live.ctl.sessions == {}
+
+
+def _gem_home(tmp_path, mode=0o600, content=TOKEN):
+    home = tmp_path / "gemhome"
+    home.mkdir()
+    if mode is not None:
+        f = home / "operator.token"
+        f.write_text(content + "\n")
+        os.chmod(f, mode)
+    return home
+
+
+def test_gemctl_heavy_reads_the_operator_token_file(live, tmp_path):
+    env = live.env("session")
+    env["GEM_HOME"] = str(_gem_home(tmp_path))
+    r = _gemctl(["heavy", "status"], env)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["b200"] == "asleep"
+
+
+@pytest.mark.parametrize("mode,needle", [(0o644, "chmod 600"), (None, "operator.token")])
+def test_gemctl_heavy_refuses_a_loose_or_missing_token_file(live, tmp_path, mode, needle):
+    env = live.env("session")
+    env["GEM_HOME"] = str(_gem_home(tmp_path, mode=mode))
+    r = _gemctl(["heavy", "on"], env)
+    assert r.returncode == 1 and needle in r.stderr and live.fake.calls == []
+
+
+def test_claude_gem_env_exports_only_the_session_token(tmp_path):
+    home = _gem_home(tmp_path)
+    (home / "lib").mkdir()
+    (home / "lib" / "gemctl.py").write_text("import os\nprint('gemctl sees', os.environ.get('GEM_LIFECYCLE_TOKEN'))\n")
+    script = ('export GEM_LIFECYCLE_TOKEN=leaked-operator LITELLM_VIRTUAL_KEY=v AUTODEV_API_BEARER_TOKEN=a '
+              f'GEM_LIFECYCLE_SESSION_TOKEN={SESSION} GEM_HOME="{home}"; '
+              f'source "{os.path.join(ROOT, "gateway", "claude-gem.env")}"; '
+              'gem heavy status; env | grep "^GEM_LIFECYCLE" | sort')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert f"gemctl sees {TOKEN}" in r.stdout                           # read from the file at call time
+    exported = [line for line in r.stdout.splitlines() if line.startswith("GEM_LIFECYCLE")]
+    assert exported == [f"GEM_LIFECYCLE_SESSION_TOKEN={SESSION}", "GEM_LIFECYCLE_URL=http://127.0.0.1:8090"]
+
+
+def test_installer_never_creates_the_operator_token(tmp_path):
+    settings, home = tmp_path / "settings.json", tmp_path / "gemhome"
+    r = subprocess.run([PY, INSTALL, "--settings", str(settings), "--gem-home", str(home)],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert not (home / "operator.token").exists() and str(home / "operator.token") in r.stdout
+
+
+# Also fixed: heavy off reports a failed scale call; the cap margin follows the measured loop period.
+
+def test_heavy_off_reports_a_failed_scale_call():
+    class NoScaleDown(gl.FakeFireworks):
+        def scale(self, n):
+            if n == 0:
+                raise gl.FireworksError("PATCH :scale: HTTP 503", 503)
+            super().scale(n)
+
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, NoScaleDown(clock, cold_start_s=0))
+    ctl.set_heavy(True)
+    clock.advance(15)
+    ctl.tick()
+    code, body = ctl.set_heavy(False)
+    assert code == 502 and "503" in body["detail"]
+
+
+def test_cap_margin_follows_the_measured_loop_period():
+    clock = gl.FakeClock(gl.SIM_START)
+    ctl = _mk(clock, gl.FakeFireworks(clock))
+    gl._preload(ctl, day_usd=25.2, week_usd=25.2)         # $0.80 left; one 15 s poll margin is $0.43
+    for _ in range(3):
+        clock.advance(15)
+        ctl.tick()
+    assert ctl.capped is None
+    clock.advance(40)                                     # a loop iteration slowed down by API timeouts
+    ctl.tick()
+    assert ctl.loop_period_s == 40 and ctl.capped == "day"
+    clock.advance(15)
+    ctl.tick()
+    assert ctl.capped is None
+    clock.advance(6 * 86400)                              # a long gap is bounded, not taken as the loop period
+    gl._preload(ctl, day_usd=23.0, week_usd=23.0)         # $3 left > the bounded (15+60 s) margin of $2.17
+    ctl.tick()
+    assert ctl.capped is None

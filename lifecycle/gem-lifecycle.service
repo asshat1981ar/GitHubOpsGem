@@ -3,7 +3,11 @@
 #   journalctl -u gem-lifecycle -f        # one JSON line per decision (scale, cap_tripped, check_failed, ...)
 #
 # If this service stops, nothing scales the B200 down except Fireworks' own scale-to-zero window, so keep that
-# window at 5m (the controller warns at startup when it is longer).
+# window at 5m (the controller warns at startup when it is longer). Remove it with deploy_awsbox.sh --uninstall,
+# which puts the B200 to sleep first.
+#
+# EnvironmentFile= is not a shell: "KEY=13.0  # note" makes the value "13.0  # note". Keep comments on their own
+# line; deploy_awsbox.sh refuses (or rewrites) values with whitespace or "#".
 
 [Unit]
 Description=GitHubOpsGem B200 lifecycle controller (wake/sleep + GPU spend caps)

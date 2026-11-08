@@ -3,7 +3,7 @@
 
 When the last registered session ends, the controller schedules the B200 to scale to zero 45 s later,
 unless a new session starts or traffic arrives first. Prints nothing and always exits 0, so it can never
-hold up Claude Code's exit. Without GEM_LIFECYCLE_TOKEN it does nothing.
+hold up Claude Code's exit. Uses the SESSION token (GEM_LIFECYCLE_SESSION_TOKEN); without it, it does nothing.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ def main() -> int:
         if sys.stdin is not None and not sys.stdin.isatty():
             data = json.loads(sys.stdin.read() or "{}")
         import gem_lifecycle_client as lc
-        if lc.configured():
-            lc.call("POST", "/session/end", {"session_id": str((data or {}).get("session_id", ""))}, timeout=3.0)
+        if lc.configured("session"):
+            lc.call("POST", "/session/end", {"session_id": str((data or {}).get("session_id", ""))}, timeout=3.0,
+                    role="session")
     except Exception:  # noqa: BLE001 - never block exit
         pass
     return 0
