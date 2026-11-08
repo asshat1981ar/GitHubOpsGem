@@ -1,0 +1,59 @@
+# gem-review caller: minimal example for a consuming repository (GitHubOpsGem WU-10).
+#
+# 1. Create the gem repo first. asshat1981ar/GitHubOpsGem DOES NOT EXIST YET: create it, push the gem
+#    (with ci/gem-review.yml installed as .github/workflows/gem-review.yml), and note a commit SHA:
+#      git ls-remote https://github.com/asshat1981ar/GitHubOpsGem refs/heads/main
+# 2. Copy this file to .github/workflows/gem-review.yml in the repo to guard. Replace BOTH placeholder
+#    SHAs (the all-zero ones) with that same commit and update the version comment.
+# 3. Open a PR so the check runs once; GitHub only offers a check in rulesets after it has reported.
+#
+# Make it a required status check with a branch ruleset (in the consuming repo):
+#   Settings > Rules > Rulesets > New ruleset > New branch ruleset
+#     Enforcement status: Active. Bypass list: empty, or admins with "For pull requests only".
+#     Target branches: Include default branch (add release branches if you have them).
+#     Rules: Require a pull request before merging
+#            Require status checks to pass > Add checks > "gem-review / scan"
+#              (the name is "<caller job name> / <reusable job name>"), and set its source to
+#              "GitHub Actions" so no other app or commit status can satisfy it
+#            Block force pushes
+#   The same through the API, once you have decided to turn it on:
+#     gh api -X POST repos/OWNER/REPO/rulesets --input ruleset.json
+#   with a rule like {"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy":
+#   false, "required_status_checks": [{"context": "gem-review / scan", "integration_id": 15368}]}}
+#   (15368 is the GitHub Actions app).
+#
+# Caveats:
+#   - On pull_request, GitHub runs the workflow file from the PR itself, so a PR could edit this caller
+#     (for example to fail_on: never). Protect it: put .github/workflows/ in CODEOWNERS and turn on
+#     "Require review from Code Owners" in the ruleset. In an organization, an org ruleset with
+#     "Require workflows to pass before merging" runs gem-review from a ref the PR cannot change.
+#   - Do not add paths: filters. A required check whose workflow never starts stays "Expected" and
+#     blocks the merge.
+#   - Pull requests from forks get a read-only token and no secrets. gem-review needs neither, so no
+#     `secrets:` are passed (never `secrets: inherit`).
+
+name: gem-review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read # checkout of the PR head and of the gem
+  pull-requests: read # PR metadata only; nothing is written back
+
+concurrency:
+  # One group per PR; a new push cancels the superseded run.
+  group: gem-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  gem-review:
+    name: gem-review
+    # A job that calls a reusable workflow cannot set timeout-minutes; the called job sets it (15 min).
+    permissions:
+      contents: read # checkout of the PR head and of the gem
+      pull-requests: read # PR metadata only
+    uses: asshat1981ar/GitHubOpsGem/.github/workflows/gem-review.yml@0000000000000000000000000000000000000000 # v5.4.0 (placeholder SHA)
+    with:
+      gem_ref: "0000000000000000000000000000000000000000" # same commit as the uses: pin above
+      fail_on: critical

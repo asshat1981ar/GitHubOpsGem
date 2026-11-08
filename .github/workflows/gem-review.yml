@@ -1,0 +1,156 @@
+# gem-review: hardened reusable workflow (GitHubOpsGem WU-10).
+#
+# Runs the gem's own scanners on every pull request as a server-side check that an agent cannot skip
+# by turning off its local hooks:
+#   gemctl scan-diff  per changed file (secrets, CWE-94 expression injection, unpinned Action SHAs,
+#                     the privileged PR trigger, write-all permissions); CRITICAL findings fail the check
+#   gemctl debt       on the whole patch (LLM tech-debt metrics; advisory only)
+#
+# Where it lives: reusable workflows must sit in .github/workflows/, so this file is installed in the
+# gem repo as .github/workflows/gem-review.yml. It is staged at ci/gem-review.yml until that repo exists.
+# The default gem_repository, asshat1981ar/GitHubOpsGem, DOES NOT EXIST YET: create it (public; a
+# private gem repo needs a read token for the second checkout, which this workflow does not take), push
+# this tree, then point callers at a commit of it. See ci/gem-review-caller.example.yml.
+#
+# The gem has no PyPI package, so the job checks out the gem itself at gem_ref (a full commit SHA) next
+# to the code under review. The steps run ci/gem_review_steps.py from that gem checkout, so a pull
+# request can never change the code that reviews it. Pass the same commit as gem_ref that you pin the
+# caller's `uses:` to, so the workflow and its helper always match.
+#
+# Hardening (each point is asserted by tests/test_workflow.py):
+#   - every third-party `uses:` is pinned to a 40-char commit SHA with a `# vX.Y.Z` comment
+#   - permissions are read-only (contents: read, pull-requests: read) at workflow and job level
+#   - only reachable through workflow_call from a caller triggered by plain `pull_request`
+#   - no expression is expanded inside `run:`; every value reaches the shell through `env:`
+#   - actions/checkout runs with persist-credentials: false; every job sets timeout-minutes
+#   - one concurrency group per PR; the PR's code is diffed and read, never executed
+#
+# Pinned actions (tags resolved with `git ls-remote --tags`; all three are lightweight tags, so the
+# tag SHA is the commit SHA):
+#   actions/checkout        v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
+#   actions/setup-python    v7.1.0  6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+#   actions/upload-artifact v7.0.2  cf430e030ddbb5b0abf93d22962f4752f3646cd9
+
+name: gem-review
+
+on:
+  workflow_call:
+    inputs:
+      gem_repository:
+        description: owner/name of the GitHubOpsGem repo that provides gemctl.py (does not exist yet; see header).
+        type: string
+        required: false
+        default: asshat1981ar/GitHubOpsGem
+      gem_ref:
+        description: Full 40-hex commit SHA of the gem to run. Tags and branch names are rejected.
+        type: string
+        required: true
+      fail_on:
+        description: "'critical' fails the check on any CRITICAL finding; 'never' only reports."
+        type: string
+        required: false
+        default: critical
+      base_ref:
+        description: Branch, tag or commit to diff against (via the merge base). Empty means the PR's base commit.
+        type: string
+        required: false
+        default: ""
+
+# Read-only. contents: read lets actions/checkout fetch the repo; pull-requests: read is the only other
+# scope the gem may need for PR metadata. A called workflow can never exceed its caller's token.
+permissions:
+  contents: read # actions/checkout of the PR head and of the gem
+  pull-requests: read # PR metadata only; nothing is written back
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout of the PR head and of the gem
+      pull-requests: read # PR metadata only; nothing is written back
+    concurrency:
+      # One group per PR. It deliberately differs from the caller's group: a reusable workflow that
+      # shares its caller's concurrency group cancels itself.
+      group: gem-review-scan-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      - name: Validate inputs
+        env:
+          GEM_REPOSITORY: ${{ inputs.gem_repository }}
+          GEM_REF: ${{ inputs.gem_ref }}
+          FAIL_ON: ${{ inputs.fail_on }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          fail() { printf 'gem-review: invalid input: %s\n' "$1" >&2; exit 1; }
+          [[ "$GEM_REF" =~ ^[0-9a-fA-F]{40}$ ]] || fail "gem_ref must be a full 40-hex commit SHA"
+          [[ "$GEM_REPOSITORY" =~ ^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$ ]] || fail "gem_repository must be owner/name"
+          [[ "$FAIL_ON" == critical || "$FAIL_ON" == never ]] || fail "fail_on must be critical or never"
+          if [[ -n "$BASE_REF" ]]; then
+            [[ "$BASE_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$ && "$BASE_REF" != *..* ]] \
+              || fail "base_ref must be a branch, tag or commit SHA"
+          fi
+          echo "gem-review: inputs ok"
+
+      - name: Check out the pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: target
+          fetch-depth: 0 # full history, so the merge base with the PR base is always present
+          persist-credentials: false
+
+      - name: Check out the gem at gem_ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.gem_repository }}
+          ref: ${{ inputs.gem_ref }}
+          path: gem
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Compute the diff against the merge base
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python -I gem/ci/gem_review_steps.py diff --repo target --work "$RUNNER_TEMP/gem-review" \
+            --base "$BASE_REF" --pr-base-sha "$PR_BASE_SHA"
+
+      - name: Scan each changed file (gemctl scan-diff)
+        run: python -I gem/ci/gem_review_steps.py scan --gem gem --work "$RUNNER_TEMP/gem-review"
+
+      - name: Measure LLM tech debt (gemctl debt)
+        run: python -I gem/ci/gem_review_steps.py debt --gem gem --work "$RUNNER_TEMP/gem-review"
+
+      - name: Write the job summary
+        env:
+          FAIL_ON: ${{ inputs.fail_on }}
+          GEM_REF: ${{ inputs.gem_ref }}
+        run: |
+          python -I gem/ci/gem_review_steps.py summary --work "$RUNNER_TEMP/gem-review" \
+            --fail-on "$FAIL_ON" --gem-ref "$GEM_REF" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the JSON results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gem-review-results
+          path: ${{ runner.temp }}/gem-review/results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail on critical findings
+        env:
+          FAIL_ON: ${{ inputs.fail_on }}
+        run: python -I gem/ci/gem_review_steps.py enforce --work "$RUNNER_TEMP/gem-review" --fail-on "$FAIL_ON"

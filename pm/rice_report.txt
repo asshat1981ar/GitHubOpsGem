@@ -1,0 +1,92 @@
+============================================================
+RICE PRIORITIZATION RESULTS
+============================================================
+
+📊 TOP PRIORITIZED FEATURES
+
+1. WU-03 Finalize gateway config v6 + client env
+   RICE Score: 120.0
+   Reach: 60 | Impact: high | Confidence: high | Effort: xs
+
+2. WU-08 Claude Code policy hooks (Bash git + MCP writes + wake/sleep)
+   RICE Score: 60.0
+   Reach: 60 | Impact: massive | Confidence: high | Effort: s
+
+3. WU-12 Skill + CLAUDE.md repair
+   RICE Score: 60.0
+   Reach: 60 | Impact: medium | Confidence: high | Effort: xs
+
+4. WU-11 Warn-week per-rule graduation report
+   RICE Score: 60.0
+   Reach: 60 | Impact: medium | Confidence: high | Effort: xs
+
+5. WU-04 gemctl CLI + gemcore package
+   RICE Score: 40.0
+   Reach: 60 | Impact: high | Confidence: high | Effort: s
+
+6. WU-07 Lifecycle controller + GPU-second meter + auto-delete guard
+   RICE Score: 36.0
+   Reach: 60 | Impact: massive | Confidence: high | Effort: m
+
+7. WU-06 Gateway conformance harness
+   RICE Score: 20.0
+   Reach: 60 | Impact: medium | Confidence: high | Effort: s
+
+8. WU-05 LiteLLM gem_guardrail plugin
+   RICE Score: 19.2
+   Reach: 60 | Impact: high | Confidence: medium | Effort: m
+
+9. WU-10 Server-side gem-review workflow + rulesets
+   RICE Score: 13.33
+   Reach: 20 | Impact: high | Confidence: high | Effort: s
+
+10. WU-09 Signed receipts as git trailers + verifier
+   RICE Score: 8.0
+   Reach: 30 | Impact: medium | Confidence: medium | Effort: s
+
+
+📈 PORTFOLIO ANALYSIS
+
+Total Features: 15
+Total Effort: 78 person-months
+Total Reach: 577 users
+Average RICE Score: 29.37
+
+🎯 Quick Wins: 4 features
+   • WU-03 Finalize gateway config v6 + client env (RICE: 120.0)
+   • WU-08 Claude Code policy hooks (Bash git + MCP writes + wake/sleep) (RICE: 60.0)
+   • WU-04 gemctl CLI + gemcore package (RICE: 40.0)
+
+🚀 Big Bets: 1 features
+   • LATS search over candidate patches (RICE: 0.77)
+
+
+📅 SUGGESTED ROADMAP
+
+
+Q1 - Capacity: 14/15 person-months
+   • WU-03 Finalize gateway config v6 + client env (RICE: 120.0)
+   • WU-08 Claude Code policy hooks (Bash git + MCP writes + wake/sleep) (RICE: 60.0)
+   • WU-12 Skill + CLAUDE.md repair (RICE: 60.0)
+   • WU-11 Warn-week per-rule graduation report (RICE: 60.0)
+   • WU-04 gemctl CLI + gemcore package (RICE: 40.0)
+   • WU-07 Lifecycle controller + GPU-second meter + auto-delete guard (RICE: 36.0)
+
+Q2 - Capacity: 14/15 person-months
+   • WU-06 Gateway conformance harness (RICE: 20.0)
+   • WU-05 LiteLLM gem_guardrail plugin (RICE: 19.2)
+   • WU-10 Server-side gem-review workflow + rulesets (RICE: 13.33)
+   • WU-09 Signed receipts as git trailers + verifier (RICE: 8.0)
+
+Q3 - Capacity: 11/15 person-months
+   • WU-14 Tech-debt sensor v2 (compiler/linter DUR + resolver AUP) (RICE: 2.0)
+   • WU-13 Opal Gem report-only UI (RICE: 0.83)
+
+Q4 - Capacity: 13/15 person-months
+   • LATS search over candidate patches (RICE: 0.77)
+
+Q5 - Capacity: 13/15 person-months
+   • WU-15 aTRIZ-SWE v2 advisory engine (RICE: 0.38)
+
+Q6 - Capacity: 13/15 person-months
+   • Z3 SMT invariant discharge (RICE: 0.04)

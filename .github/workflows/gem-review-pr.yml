@@ -1,0 +1,29 @@
+# gem-review on this repository's own pull requests (dogfooding). Required by the "main protection" ruleset
+# (ci/rulesets/main.json) as the status check "gem-review / scan".
+#
+# The scanner runs from the PR's BASE commit (gem_ref below), so a PR cannot weaken the code that reviews it.
+# The workflow files themselves come from the PR head, as always for pull_request; CODEOWNERS routes every
+# change under .github/ to the owner, who reviews those diffs before merging.
+name: gem-review
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read # checkout of the PR head and of the gem at the base commit
+  pull-requests: read # PR metadata only; nothing is written back
+concurrency:
+  group: gem-review-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  gem-review:
+    name: gem-review
+    permissions:
+      contents: read # checkout of the PR head and of the gem
+      pull-requests: read # PR metadata only
+    # For reusable-workflow calls ./ already resolves to the caller's own commit, so GitHub's newer $/ syntax adds
+    # no safety here, and actionlint 1.7.12 cannot parse $/ yet. Revisit when actionlint supports it.
+    uses: ./.github/workflows/gem-review.yml # zizmor: ignore[self-repository]
+    with:
+      gem_repository: ${{ github.repository }}
+      gem_ref: ${{ github.event.pull_request.base.sha }}
+      fail_on: critical

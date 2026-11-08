@@ -1,0 +1,97 @@
+goal_contract:
+  id: GC-007
+  created: 2026-11-07
+  raw_input: >
+    digest all the files in the .zip gaining comprehensive semantic understanding of the project, what is done,
+    what is required. Identify needed logic, modules, micro services, features, identify the scope then augment
+    this context and engineer it and feed it to the available skills
+  interpreted_goal: >
+    Turn autodev_atriz_deepseek_framework_v5 (GitHubOpsGem v5 + aTRIZ-SWE + DeepSeek V4.1 Flash on a
+    Fireworks 4xB200 dedicated deployment behind LiteLLM, driven by Claude Code in Termux) from a
+    spec-and-library bundle into an enforced, repo-agnostic runtime: every guardrail the docs promise is
+    executed by code at a real enforcement point (LiteLLM hook, Claude Code hook, GitHub required check),
+    the GPU is billed only while a session needs it, and gate decisions are code-emitted and signed.
+  evidence:
+    - source: bundle audit (19 executable probes, probes.py)
+      finding: v5 fails 19/19 probes; v5.1 passes 0/19 defects and 80 pytest tests.
+    - source: litellm_fireworks_config.yaml
+      finding: all three model aliases route to the same B200 deployment; no master_key; no callbacks or guardrails.
+    - source: repo-wide grep
+      finding: DeepSeekProtocolSanitizer / StatefulGitHubOpsMonitor are never invoked by LiteLLM, Claude Code or GitHub; bootstrap only runs their self-test.
+    - source: Fireworks docs (ondemand-deployments, glossary)
+      finding: dedicated deployments bill per GPU-second; scale-to-zero window defaults to 1h; scaled-to-zero requests get an immediate 503; min-replica-0 deployments auto-delete after 7 days without traffic.
+    - source: Fireworks API reference (scale-deployment, list-deployments) + billing FAQ, checked 2026-11-07
+      finding: "PATCH /v1/accounts/{a}/deployments/{d}:scale {replicaCount} (firectl deployment scale) sets replicas directly, including to zero; deployments report state, replicaCount, desiredReplicaCount, minReplicaCount, maxReplicaCount, acceleratorCount, autoscalingPolicy.scaleToZeroWindow; billing starts when the server begins accepting requests, per GPU-second; deleted deployments can be undeleted. Corrects the earlier note that no force-scale command exists."
+    - source: Fireworks Python SDK fireworks-ai 1.2.32 (types/deployment.py, deployment_update_params.py) + firectl deployment update docs
+      finding: "No unused-auto-delete field exists in the Deployment model, and `firectl deployment update` has no auto-delete flag (create-time only), so it can be neither read nor changed after creation. deleteTime = 'time at which the resource will be soft deleted', purgeTime = hard delete, expireTime = automatic deletion. maxReplicaCount may be set to 0 to hold the deployment at zero (possible hard-off for caps; not used yet)."
+    - source: LiteLLM 1.108.2 source (installed and exercised)
+      finding: CustomLogger.log_pre_api_call / async_log_success_event / async_log_failure_event fire for Router calls; router metadata is in litellm_params.litellm_metadata (new routes such as /v1/messages) or litellm_params.metadata.
+    - source: third-party price trackers, Oct 2026
+      finding: B200 about $13/GPU-hour on Fireworks after Sept 2026 increase -> about $52/h for a 4-GPU replica (confirm on fireworks.ai/pricing).
+    - source: LiteLLM docs (custom guardrail)
+      finding: post_call guardrails are audit-only for streams; real-time filtering needs async_post_call_streaming_iterator_hook.
+    - source: Claude Code hooks docs + provider guides (Kimi, MiniMax, Hyper)
+      finding: PreToolUse exit 2 blocks; SessionStart/SessionEnd hooks exist; ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL, CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_AUTO_COMPACT_WINDOW pin tiers and context.
+    - source: Unified framework PDF + Linear Deployment Ledger + PRO-78 (2026-11-07)
+      finding: PRO-78 (Urgent, In Progress) ticks 3/4 criteria; the open one is live B200 smoke on AutoDev + Chimera worktrees. Ledger claims enforcement by route_and_check_circuit_breaker, which nothing calls.
+    - source: arXiv:2606.14796 (the MLR the spec cites)
+      finding: AUP and DUR (Wang et al.) are independent; DUR = deprecated share of plausible API completions; PSC (Velasco et al.) is a model-level propensity. The spec's AUP = 1 - DUR is not in the source.
+    - source: Unified PDF section 5
+      finding: strict fast-integration rule (block merge until tests pass) and house-policy flags for `claude --print` / `os.system` — now encoded in v5.2.
+    - source: AutoDev Working APK v0 Evidence Ledger (2026-08-17, may be stale)
+      finding: ForgeCore AuthorizationGrant + evidence gates are a non-negotiable authority boundary; gem receipts must not become a second authority.
+  personas:
+    - who: Aaron (solo developer, sole approver)
+      context_of_use: Claude Code in Termux on Android -> SSH tunnel -> LiteLLM on awsbox -> Fireworks B200; GitHub repos for Chimera, OllamaDev, gadk.
+  mvp_scope:
+    - {id: F1, feature: "gemcore v5.1 library + gemctl JSON CLI", rationale: constraint}
+    - {id: F2, feature: "LiteLLM gem_guardrail plugin (stream think-strip, allowlisted tool repair, budgets, loop breaker, cold-start hold)", rationale: table-stakes}
+    - {id: F3, feature: "Deployment lifecycle controller (wake/sleep, 3m idle, 45s post-session, GPU-second meter + daily cap, auto-delete guard)", rationale: constraint}
+    - {id: F4, feature: "Claude Code policy hooks (PreToolUse Bash/GitHub writes, SessionStart wake, SessionEnd sleep) with WARN->ENFORCE", rationale: table-stakes}
+    - {id: F5, feature: "Gateway conformance harness replacing LLM self-reported onboarding", rationale: table-stakes}
+    - {id: F6, feature: "Server-side enforcement: reusable gem-review workflow + rulesets", rationale: differentiator}
+    - {id: F7, feature: "Signed receipts as git trailers + provenance verifier", rationale: differentiator}
+    - {id: F8, feature: "Skill/CLAUDE.md repair (LaTeX corruption, tool names, dangling scripts/, repo-agnostic)", rationale: table-stakes}
+  out_of_scope_v1:
+    - Z3/SMT proof discharge (SOVER/KVerus)
+    - LATS tree search over patches (v2 big bet)
+    - Opal Gem as an execution runtime (kept as report UI only)
+    - Multi-user / team trust model
+  definition_of_done:
+    - "gemcore: pytest >= 80 passing; probes.py reports 0/19 defects against the shipped module"
+    - "conformance_check.py passes 6/6 against the live gateway (no <think> in 20 streamed replies, valid tool_use JSON, >96k rejected pre-call, ds-fast never hits the B200, unauthenticated call -> 401, cold start returns held/retryable not hard error)"
+    - "From Termux, `git push origin main` is warned (WARN) and blocked (ENFORCE) by the PreToolUse hook — transcript captured"
+    - "Every gate verdict on the pilot repo carries a ForgeCore attestation that /api/v1/gate/verify reports valid and recorded"
+    - "Controller log shows the B200 reaches zero within the 5-min window after a heavy run; daily and weekly GPU-second caps trip in a dry-run"
+    - "Fireworks deployment has auto-delete disabled (firectl get deployment shows it)"
+    - "Every agent commit on a pilot repo carries a Gem-Gate trailer that gemctl verify accepts"
+    - "gem-review reusable workflow is a required check on >= 1 repo"
+    - "Warn-week report lists per-rule hit and false-positive counts and the rules graduated to ENFORCE"
+  assumptions:
+    - Go-live is 2026-11-07, so GEM_ENFORCE_AFTER=2026-11-14 (warn-only week, then fail closed).
+    - Repo-agnostic means user-level hooks in ~/.claude/settings.json plus a central reusable workflow, not per-repo copies.
+    - Claude Code is the only client of the gateway; hooks must be pure Python/bash that run under Termux.
+    - Fast tier defaults to a per-token serverless model so background calls never wake the B200.
+    - DeepSeek V4.1 native tool-token format resembles the V3 family; the repair regex is flagged VERIFY until a captured leak confirms it.
+    - aTRIZ-SWE stays advisory (scores shown, never gating) in v1.
+    - Fast-integration policy = strict (unified PDF wins over v5 SKILL.md wording); `smell` remains available.
+    - Superseded 2026-11-07: ForgeCore signs gate verdicts from day one (ADR-007).
+    - The unified spec is the newest source of truth; it and its four copies should be generated from one file (WU-17).
+  escalations: []                # all three resolved 2026-11-07 (Aaron delegated; see decisions)
+  decisions:
+    - decision: Fast-tier backend
+      chosen: Fireworks serverless DeepSeek V4.1 Flash 1017 (same build as the dedicated deployment)
+      why: per token ($0.30 / $0.006 cached / $1.20 per 1M), function calling supported, no idle cost, same key and tool format
+    - decision: Cold-start strategy
+      chosen: serverless-first; B200 woken only for heavy runs or repeated 429s, work continues on serverless while it warms
+      why: scaled-to-zero requests get an immediate 503 and are not queued; cold start is "up to a few minutes"; 5 min is the minimum idle window
+    - decision: Daily caps
+      chosen: serverless $10/day (LiteLLM budget); B200 $26/day and $78/week (controller GPU-second meter)
+      why: expected serverless ~$1.60/day cached, ~$6/day uncached; B200 ~$52/hour
+    - decision: Who signs gate verdicts
+      chosen: ForgeCore (autodev-server) holds the key from day one; ADR-007, AutoDev PR #55 (draft)
+      why: gem receipts must not become a second authority; attestations are evidence, never AuthorizationGrant
+  constraints:
+    stack: Python 3 (stdlib-first for Termux), LiteLLM proxy, bash, GitHub Actions; existing repo conventions win
+    budget_tool_calls: 0
+    deadline: "warn-week ends 2026-11-14"

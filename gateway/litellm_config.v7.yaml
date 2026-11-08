@@ -1,0 +1,98 @@
+# LiteLLM gateway config v7 (DRAFT) — serverless-first, B200 as burst capacity.
+# Runs on awsbox, bound to 127.0.0.1; Claude Code (Termux) reaches it through an SSH/Tailscale tunnel.
+# Validate before use:  litellm --config litellm_config.v7.yaml --detailed_debug
+#                       python3 conformance_check.py   (WU-06)
+#
+# Decisions (2026-11-07, researched; see the doc's "Decisions" section):
+#  1. Fast tier  -> Fireworks SERVERLESS DeepSeek V4.1 Flash 1017, the same model build as the dedicated
+#                   deployment. Per token ($0.30 in / $0.006 cached / $1.20 out per 1M), no idle cost,
+#                   function calling supported, same API key, same tool-call behaviour.
+#  2. Cold start -> nobody waits on one. ds-main is serverless (always warm). The 4xB200 deployment is
+#                   woken only for heavy runs (`gem heavy on`) or by repeated 429s, and Claude Code keeps
+#                   working on serverless while it warms. Fireworks' minimum scale-to-zero window is 5 min.
+#  3. Daily caps -> serverless $10/day (LiteLLM budget; meaningful now because these tokens have a price);
+#                   B200 $26/day and $78/week (lifecycle controller GPU-second meter, WU-07).
+
+model_list:
+  # Default for every Claude Code tier: always warm, billed per token.
+  - model_name: ds-main
+    litellm_params:
+      model: openai/accounts/fireworks/models/deepseek-v4p1-flash-1017
+      api_base: https://api.fireworks.ai/inference/v1
+      api_key: os.environ/FIREWORKS_API_KEY
+      max_tokens: 16384
+      timeout: 300
+      stream_timeout: 300
+    model_info:
+      max_input_tokens: 96000          # parity with the dedicated shape; keeps per-turn cost bounded
+      max_output_tokens: 16384
+      supports_function_calling: true
+      input_cost_per_token: 0.0000003
+      cache_read_input_token_cost: 0.000000006
+      output_cost_per_token: 0.0000012
+
+  # Background / haiku-tier work: same model, smaller output cap.
+  - model_name: ds-fast
+    litellm_params:
+      model: openai/accounts/fireworks/models/deepseek-v4p1-flash-1017
+      api_base: https://api.fireworks.ai/inference/v1
+      api_key: os.environ/FIREWORKS_API_KEY
+      max_tokens: 4096
+      timeout: 60
+    model_info:
+      max_input_tokens: 32000
+      max_output_tokens: 4096
+      supports_function_calling: true
+      input_cost_per_token: 0.0000003
+      cache_read_input_token_cost: 0.000000006
+      output_cost_per_token: 0.0000012
+
+  # Burst capacity: the dedicated 4xB200 deployment. Billed per GPU-second while up,
+  # so LiteLLM cost is 0 here on purpose; the lifecycle controller meters and caps it.
+  - model_name: ds-burst
+    litellm_params:
+      model: os.environ/GEM_BURST_MODEL   # "openai/accounts/<acct>/deployments/<id>"
+      api_base: https://api.fireworks.ai/inference/v1
+      api_key: os.environ/FIREWORKS_API_KEY
+      max_tokens: 16384
+      timeout: 600
+      stream_timeout: 600
+    model_info:
+      max_input_tokens: 96000
+      max_output_tokens: 16384
+      supports_function_calling: true
+
+router_settings:
+  model_group_alias:                  # safety net for old/hard-coded IDs
+    claude-3-7-sonnet-20250219: ds-main
+    claude-3-5-haiku-20241022: ds-fast
+  fallbacks:
+    - ds-main: [ds-burst]             # only helps when the B200 is already warm; a cold one answers 503
+                                      # (the lifecycle controller undoes such stray wakes when capped)
+  enable_pre_call_checks: true        # reject >max_input_tokens before it reaches Fireworks
+  disable_cooldowns: true
+  num_retries: 2
+  retry_after: 10
+  timeout: 600
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  cache: false                        # never replay a cached completion into an agent loop
+  max_budget: 10                      # USD, serverless spend; B200 time is capped by the controller
+  budget_duration: 1d
+  # WU-07: ds-burst traffic keeps the B200 awake; ds-main 429 storms wake it. File sits next to this config.
+  # Needs GEM_LIFECYCLE_TOKEN (and optionally GEM_LIFECYCLE_URL) in LiteLLM's environment.
+  # WU-05: gem_guardrail strips <think>...</think> from streamed and non-streamed output (/chat/completions and
+  # /v1/messages). Sits next to this config with mcp_reference_monitor.py beside it (or in $GEM_HOME/lib).
+  callbacks: [gem_lifecycle_callback.proxy_handler_instance, gem_guardrail.proxy_handler_instance]
+  # guardrails: enable after WU-05 (gem_guardrail.py) ships and passes conformance
+  # guardrails:
+  #   - guardrail_name: gem-protocol
+  #     litellm_params:
+  #       guardrail: gem_guardrail.GemProtocolGuardrail
+  #       mode: pre_call
+  #       default_on: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

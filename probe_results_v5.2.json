@@ -1,0 +1,116 @@
+[
+  {
+    "id": "P01",
+    "title": "Added line starting with '++' is dropped -> every later line number shifts (HTTP 422 risk)",
+    "confirmed": false,
+    "evidence": "valid right lines=[1, 2, 3] expected [1, 2, 3]"
+  },
+  {
+    "id": "P02",
+    "title": "Protected-branch lock bypassed with 'refs/heads/main'",
+    "confirmed": false,
+    "evidence": "push_files -> refs/heads/main: allowed=False (BLOCK: Direct write to protected branch 'main' is forbidden.)"
+  },
+  {
+    "id": "P03",
+    "title": "Reasoning leaks when model emits only a closing </think> (template-prefilled <think>)",
+    "confirmed": false,
+    "evidence": "cleaned='Final answer' strips=1"
+  },
+  {
+    "id": "P04",
+    "title": "XML repair turns echoed text into an arbitrary privileged tool_use (merge_pull_request)",
+    "confirmed": false,
+    "evidence": "repaired tool names=[]"
+  },
+  {
+    "id": "P05",
+    "title": "ABI 'verification' = merely issuing a search; one query can verify every symbol",
+    "confirmed": false,
+    "evidence": "required=['alpha', 'beta'] merge allowed after one blind query=False"
+  },
+  {
+    "id": "P06",
+    "title": "Cross-boundary extractor misses common FFI forms",
+    "confirmed": false,
+    "evidence": "missed: []"
+  },
+  {
+    "id": "P07",
+    "title": "Workflow scanner misses quoted/reusable `uses:` and common CWE-94 sinks",
+    "confirmed": false,
+    "evidence": "flagged lines=[1, 2, 3, 4, 5, 6] of 6 dangerous lines (1..6)"
+  },
+  {
+    "id": "P08",
+    "title": "CI log windowing keeps the LAST errors and drops the first (root-cause) error",
+    "confirmed": false,
+    "evidence": "root cause kept=True, output lines=220"
+  },
+  {
+    "id": "P09",
+    "title": "Loop breaker counts identical calls, not identical FAILED retries; never resets",
+    "confirmed": false,
+    "evidence": "3rd successful `git status` allowed=True (PASS)"
+  },
+  {
+    "id": "P10",
+    "title": "Router uses stale Claude Code tool names: current `Grep`/`Glob`/`Read` route to the B200",
+    "confirmed": false,
+    "evidence": "{\"Grep\": \"local-fast-tier\", \"Glob\": \"local-fast-tier\", \"Read\": \"local-fast-tier\"}"
+  },
+  {
+    "id": "P11",
+    "title": "DUR sensor penalises @Deprecated declarations and the supported headless CLI (`claude --print`)",
+    "confirmed": false,
+    "evidence": "@Deprecated decl DUR=0.0; supported headless `claude --print` DUR=0.0"
+  },
+  {
+    "id": "P12",
+    "title": "Gate never consults tech-debt or aTRIZ metrics: PSC=1.0 patch still gets PASS",
+    "confirmed": false,
+    "evidence": "PSC=0.6, debts=6, merge gate=BLOCK: Fast-integration debt: PSC=0.60 DUR=0.00 with no tests."
+  },
+  {
+    "id": "P13",
+    "title": "State machine not enforced: write gate callable before any ingest/graph phase",
+    "confirmed": false,
+    "evidence": "APPROVE+merge with zero ingested files -> BLOCK: Review/merge action without ingested PR evidence (phase guard). (start phase was INGEST)"
+  },
+  {
+    "id": "P14",
+    "title": "Outbound write payloads are never scanned: push_files with a key in content passes",
+    "confirmed": false,
+    "evidence": "gate params=['tool_name', 'target_branch', 'action_event', 'payload_text', 'debt_report']; push allowed=False"
+  },
+  {
+    "id": "P15",
+    "title": "Injection alert does not block feature-branch pushes or PR creation",
+    "confirmed": false,
+    "evidence": "alerts=2 push=False create_pr=False"
+  },
+  {
+    "id": "P16",
+    "title": "Secret scanner misses Anthropic/OpenAI/Slack/Google key shapes",
+    "confirmed": false,
+    "evidence": "missed: []"
+  },
+  {
+    "id": "P19",
+    "title": "CI error-marker regex blind to gcc/clang/rustc `error:`, tsc, npm, Kotlin `e:`, pytest, Python tracebacks",
+    "confirmed": false,
+    "evidence": "0/8 unrecognized: []"
+  },
+  {
+    "id": "P17",
+    "title": "Ideality returns inf -> receipts serialize to invalid JSON (`Infinity`)",
+    "confirmed": false,
+    "evidence": "{\"ideality\": 1000000.0}"
+  },
+  {
+    "id": "P18",
+    "title": "Outer injection pattern evaded by trivial rephrasing",
+    "confirmed": false,
+    "evidence": "alerts=['Raw injection match in pr#2: \\\\b(ignore|disregard|forget|override)\\\\b[^.\\\\n]{0,40}\\\\b(previou', 'Raw injection match in pr#2: (system prompt override|new system instruction|you are now (', 'Normalized injection match in pr#2: \\\\b(ignore|disregard|forget|override)\\\\b[^.\\\\n]{0,40}\\\\b(previou', 'Normalized injection match in pr#2: (system prompt override|new system instruction|you are now (']"
+  }
+]

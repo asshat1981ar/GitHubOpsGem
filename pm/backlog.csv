@@ -1,0 +1,16 @@
+name,reach,impact,confidence,effort,description
+WU-07 Lifecycle controller + GPU-second meter + auto-delete guard,60,massive,high,m,4xB200 bills ~$52/h; v5 inherits 1h idle default and a token budget LiteLLM cannot price
+WU-08 Claude Code policy hooks (Bash git + MCP writes + wake/sleep),60,massive,high,s,Only enforcement point for local git push; starts warn-week clock
+WU-03 Finalize gateway config v6 + client env,60,high,high,xs,Auth + fast tier off the B200 + pinned model tiers + 96k compaction
+WU-04 gemctl CLI + gemcore package,60,high,high,s,Enabler: hooks / CI / controller call one CLI
+WU-05 LiteLLM gem_guardrail plugin,60,high,medium,m,Streaming think-strip + allowlisted repair + budgets; V4.1 leak format unverified
+WU-12 Skill + CLAUDE.md repair,60,medium,high,xs,Control-char LaTeX corruption + stale tool names + dangling scripts/
+WU-06 Gateway conformance harness,60,medium,high,s,Replaces self-reported onboarding with real checks
+WU-11 Warn-week per-rule graduation report,60,medium,high,xs,Decides which rules fail closed on 2026-11-14
+WU-10 Server-side gem-review workflow + rulesets,20,high,high,s,Unbypassable by the agent
+WU-09 Signed receipts as git trailers + verifier,30,medium,medium,s,Turns provenance from self-attested to verifiable
+WU-14 Tech-debt sensor v2 (compiler/linter DUR + resolver AUP),20,medium,medium,l,Real metrics instead of regex heuristics
+WU-13 Opal Gem report-only UI,5,low,high,s,Stop always-green dashboard
+WU-15 aTRIZ-SWE v2 advisory engine,10,medium,low,xl,Schema-validated contradictions + FMEA register
+LATS search over candidate patches,10,high,low,xl,Test-runner value function; research-grade
+Z3 SMT invariant discharge,2,low,low,xl,Only for arithmetic/bounds invariants
