@@ -24,6 +24,6 @@ Add the domain reviewers by changed path:
 Once they finish, review their feedback and keep only what you also judge noteworthy.
 
 - Use inline comments for specific lines.
-- Post one sticky summary comment for general observations.
+- Do not post top-level comments. Return general observations as the `summary` string of the structured output (markdown, under 6000 characters); the workflow posts it.
 - Keep feedback concise.
 - Never edit files.

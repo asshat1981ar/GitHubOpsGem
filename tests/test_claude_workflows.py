@@ -174,20 +174,45 @@ def test_claude_yml_allows_no_build_tools():
     assert tools
     for t in tools:
         assert t.startswith(("Bash(git diff", "Bash(git log", "Bash(git status", "Bash(git show",
-                             "Bash(gh pr view", "Bash(gh pr diff", "Bash(gh issue view")), t
+                             "Bash(gh pr diff")), t
         assert not BUILD_TOOL.search(t[len('Bash('):]), t
+    # comment-returning gh commands bypass the actor filters; deny them explicitly (auto mode may approve unlisted tools)
+    denied = re.search(r'--disallowedTools "([^"]*)"', claude["with"]["claude_args"]).group(1)
+    for d in ("Bash(gh pr view:*)", "Bash(gh issue view:*)", "Bash(gh api:*)", "Bash(gh search:*)",
+              "Bash(bash:*)", "Bash(sh:*)", "Bash(make:*)", "Bash(python:*)"):
+        assert d in denied, d
 
 
 @pytest.mark.parametrize("path", [WF_DIR / "claude-review.yml", WF_DIR / "claude-gem-verdict.yml"], ids=lambda p: p.name)
 def test_agent_mode_jobs_do_not_read_comments(path):
     text = path.read_text(encoding="utf-8")
     assert "include_comments_by_actor" not in text
-    assert "gh api" not in text and "--comments" not in text
+    assert "--comments" not in text
     for job in load(path)["jobs"].values():
         for s in claude_steps(job):
             tools = _allowed(s)
-            assert "Bash(gh pr view:*)" not in tools
-            assert not any(t.startswith("Bash(gh api") or t.startswith("Bash(gh pr comment") for t in tools)
+            assert not any(t.startswith(("Bash(gh pr view", "Bash(gh issue view", "Bash(gh api", "Bash(gh pr comment"))
+                           for t in tools)
+            denied = re.search(r'--disallowedTools "([^"]*)"', s["with"]["claude_args"]).group(1)
+            for d in ("Bash(gh pr view:*)", "Bash(gh issue view:*)", "Bash(gh api:*)"):
+                assert d in denied, d
+            assert "github_token" in s["with"] and "id-token" not in job.get("permissions", {})
+
+
+def test_review_summary_posted_by_script_not_claude():
+    job = load(WF_DIR / "claude-review.yml")["jobs"]["review"]
+    (claude,) = claude_steps(job)
+    assert "--json-schema" in claude["with"]["claude_args"]
+    post = job["steps"][-1]
+    assert "!cancelled()" in str(post["if"]) and "structured_output" in str(post["if"])
+    assert "${{" not in post["run"]
+
+
+def test_verdict_label_job_is_separate_and_write_only():
+    jobs = load(WF_DIR / "claude-gem-verdict.yml")["jobs"]
+    assert jobs["verdict"]["permissions"].get("pull-requests") == "read"
+    assert jobs["label"]["permissions"] == {"pull-requests": "write"}
+    assert not claude_steps(jobs["label"])
 
 
 def test_settings_json_allow_has_no_bash():

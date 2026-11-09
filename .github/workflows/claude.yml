@@ -3,7 +3,8 @@
 # Trust model: tag mode may check out the PR head, so (1) cross-repository PRs are refused (fork step and
 # the review-event if:), (2) no build, test, package-manager or repo-script command is allowlisted (only
 # read-only git/gh; edits use the action's file tools), (3) CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 strips
-# secrets from subprocesses. Claude cannot run tests here; CI runs on its pushes without secrets.
+# secrets from subprocesses. Claude cannot run tests here; once a PR exists, gem-review runs on it without secrets.
+# (4) gh pr view / gh issue view / gh api are denied: they return comments that bypass the actor filters.
 # Residual risk: a same-repo branch the owner points Claude at is read as data, and the Claude process
 # itself still holds the tokens.
 name: claude
@@ -53,15 +54,24 @@ jobs:
           IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
         run: |
           # Fail closed: any error or unexpected answer means cross=true. Plain issues are never cross-repo.
+          # PRs whose head is a protected ref (main, master, prod*, trunk, release/*, hotfix/*) are refused too:
+          # tag mode pushes to the PR head branch.
           cross=true
           if [ "$IS_PR" != "true" ]; then
             cross=false
-          elif out=$(gh pr view "$PR" --repo "$REPO" --json isCrossRepository -q .isCrossRepository 2>/dev/null) \
-            && { [ "$out" = "true" ] || [ "$out" = "false" ]; }; then
-            cross="$out"
+          elif out=$(gh pr view "$PR" --repo "$REPO" --json isCrossRepository,headRefName -q '"\(.isCrossRepository) \(.headRefName)"' 2>/dev/null); then
+            flag="${out%% *}"
+            ref="${out#* }"
+            case "$flag" in
+              true) cross=true ;;
+              false)
+                cross=false
+                case "$ref" in main|master|prod*|trunk|release/*|hotfix/*) cross=true ;; esac
+                ;;
+            esac
           fi
           echo "cross=$cross" >> "$GITHUB_OUTPUT"
-          [ "$cross" = "true" ] && echo "::warning::cross-repository or unverifiable PR; Claude was not started"
+          [ "$cross" = "true" ] && echo "::warning::cross-repository, protected-ref or unverifiable PR; Claude was not started"
           exit 0
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,6 +93,6 @@ jobs:
             --permission-mode auto
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
             --max-turns 40
-            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*)"
-            --disallowedTools "WebFetch,WebSearch,Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(python3 -I gemctl.py gate:*),Bash(python3 -I gemctl.py heavy:*),Bash(python3 -I gemctl.py trailer:*),Bash(python3 install_hooks.py:*),Bash(sudo:*),Bash(bash lifecycle/deploy_awsbox.sh:*),Bash(./lifecycle/deploy_awsbox.sh:*),Bash(bash ci/apply_rulesets.sh:*),Bash(gh api:*),Bash(git push origin main*),Bash(git push --force*)"
-            --append-system-prompt "CI context: GitHub Actions, no ForgeCore, no gem hooks, no B200. You cannot run tests, scripts or package managers here: CI runs automatically on your pushes (without secrets) and reports results. Never run gemctl gate/heavy/trailer, never edit .github/workflows/gem-review.yml or ci/gem-review.yml (they must stay byte-identical), never touch ci/rulesets/main.json. Branches are fix/<issue>-<slug>."
+            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh search:*),Bash(git diff --no-index:*),Bash(git diff --output:*),Bash(git log --output:*),Bash(git show --output:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(bash:*),Bash(sh:*),Bash(make:*),Bash(python3 -I gemctl.py gate:*),Bash(python3 -I gemctl.py heavy:*),Bash(python3 -I gemctl.py trailer:*),Bash(python3 install_hooks.py:*),Bash(sudo:*),Bash(bash lifecycle/deploy_awsbox.sh:*),Bash(./lifecycle/deploy_awsbox.sh:*),Bash(bash ci/apply_rulesets.sh:*),Bash(gh api:*),Bash(git push --force*)"
+            --append-system-prompt "CI context: GitHub Actions, no ForgeCore, no gem hooks, no B200. You cannot run tests, scripts or package managers here: gem-review runs on a PR for your branch (without secrets) once one exists. Never run gemctl gate/heavy/trailer, never edit .github/workflows/gem-review.yml or ci/gem-review.yml (they must stay byte-identical), never touch ci/rulesets/main.json. Branches are fix/<issue>-<slug>. Never push to main, master, prod*, trunk, release/* or hotfix/*."

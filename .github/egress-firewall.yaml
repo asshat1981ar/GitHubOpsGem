@@ -16,7 +16,3 @@ allow:
   - release-assets.githubusercontent.com
   # npm packages installed by the action
   - registry.npmjs.org
-  # pip index for the pytest and pyyaml install in claude.yml
-  - pypi.org
-  # pip package files for the same install
-  - files.pythonhosted.org
