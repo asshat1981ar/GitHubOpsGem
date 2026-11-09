@@ -424,11 +424,13 @@ class UntrustedContextPolicy:
 
     @staticmethod
     def _compatible(chain: Tuple[str, ...], pattern: Tuple[str, ...]) -> bool:
+        """Match shared path components, treating '*' on either side as a wildcard."""
         # Compared over the shorter length: equal, a field below the pattern, or an object above it.
         return all(c == p or "*" in (c, p) for c, p in zip(chain, pattern))
 
     @classmethod
     def _tokens(cls, expr: str) -> List[str]:
+        """Tokenize an expression, omitting whitespace."""
         return [t for t in cls._TOKEN_RE.findall(expr) if not t.isspace()]
 
     @staticmethod
@@ -449,7 +451,7 @@ class UntrustedContextPolicy:
         are case-insensitive, so compare them lower-cased).
 
         `x['key']` becomes `x.key`; `x[0]` and `x[<expr>]` become `x.*` (the inner expression is read too).
-        String literals and function names are not contexts. Linear in the length of the expression.
+        String literals and function names are not contexts. Duplicate paths are collapsed case-insensitively.
         """
         toks = cls._tokens(expr)
         closer = cls._closers(toks)
@@ -478,14 +480,17 @@ class UntrustedContextPolicy:
 
     @classmethod
     def is_boolean(cls, expr: str) -> bool:
-        """True when the expression always yields true or false (a comparison, `!x`, contains() and the other
-        boolean functions), so its expansion cannot carry attacker text. `a || b` and `a && b` yield one of
-        their operands, so they are boolean only when every operand is."""
+        """Recognize expressions that yield a boolean, including comparisons and known boolean functions.
+
+        `a || b` and `a && b` are recognized only when every operand is boolean. Expressions over 2,000
+        tokens return False and remain eligible for scanning.
+        """
         toks = cls._tokens(expr)
         return len(toks) <= cls._MAX_BOOLEAN_TOKENS and cls._boolean_tokens(toks)
 
     @classmethod
     def _boolean_tokens(cls, toks: List[str]) -> bool:
+        """Recognize boolean results in a tokenized expression, including logical operands."""
         closer = cls._closers(toks)
         while toks and toks[0] == "(" and closer.get(0) == len(toks) - 1:
             toks = toks[1:-1]
@@ -625,6 +630,7 @@ class _FlowParser:
                 break
 
     def node(self, depth: int = 0) -> Tuple[Any, ...]:
+        """Parse a flow node at the current position; stop nesting beyond MAX_DEPTH."""
         self._ws()
         if self.i >= len(self.t) or depth > self.MAX_DEPTH:
             return ("scalar", self.i, self.i)
@@ -634,6 +640,7 @@ class _FlowParser:
         return self._scalar()
 
     def _collection(self, depth: int, opener: str) -> Tuple[Any, ...]:
+        """Parse a flow mapping or sequence into entries and source offsets."""
         close, entries, start = "}" if opener == "{" else "]", [], self.i
         self.i += 1
         while True:
@@ -663,6 +670,7 @@ class _FlowParser:
         return ("map" if opener == "{" else "seq", entries, start, self.i)
 
     def _scalar(self) -> Tuple[Any, ...]:
+        """Parse a quoted or plain scalar and return its source offsets."""
         t, s = self.t, self.i
         if s < len(t) and t[s] in "\"'":
             end = WorkflowInjectionScanner._quote_close(t, t[s], s + 1)
@@ -754,6 +762,11 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def findings(cls, file_path: str, patch_text: str, post_image: Optional[str] = None) -> List[InlineFinding]:
+        """Find unsafe expression expansions in execution sinks touching added patch lines.
+
+        Use post_image for context when it matches the patch; otherwise scan the available hunks.
+        Findings are critical, grouped by added line, and ordered by line number.
+        """
         segments, whole_file = cls._segments(patch_text, post_image)
         values: List[_Value] = []
         for lines, hunk_top in segments:
@@ -784,6 +797,7 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _message(cls, bad: List[str], where: str) -> str:
+        """Describe the unsafe contexts and a remediation for the identified sink."""
         if where == "run":
             sink, fix = "a `run:` script", cls.FIX_RUN
         elif where == "unknown":
@@ -842,6 +856,7 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _walk(cls, lines: List[Tuple[int, str, bool]], values: List[_Value], hunk_top: bool) -> None:
+        """Append values found in numbered patch or file lines, marking ambiguous hunk starts as needed."""
         stack: List[_YamlFrame] = []
         cont: Optional[_ValueCont] = None
         script_until, script, judged_until = -1, _Value(), -1
@@ -1012,8 +1027,8 @@ class WorkflowInjectionScanner:
     @classmethod
     def _script_region(cls, lines: List[Tuple[int, str, bool]], start: int) -> Tuple[int, bool]:
         """At a line no visible key owns, look at the lines from there until the text dedents: (end of that
-        region, True) if the lines at its indentation are not valid YAML structure, so the region is the inside
-        of a block scalar (a script); (end, False) if they are structure."""
+        region, True) if the lines at its indentation appear to be script rather than YAML structure;
+        (end, False) otherwise. This is a heuristic for a block scalar whose key is outside the hunk."""
         first = lines[start][1].rstrip()
         base = len(first) - len(first.lstrip(" "))
         if base == 0:
@@ -1133,7 +1148,7 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _expand_flows(cls, values: List[_Value]) -> List[_Value]:
-        """Replace flow collections that hold steps, `with:`, `env:` or matrix entries by their entries."""
+        """Keep the values and append entries extracted from relevant flow collections."""
         out: List[_Value] = []
         for v in values:
             out.append(v)
@@ -1157,6 +1172,7 @@ class WorkflowInjectionScanner:
                 return n[1] if n[0] == "seq" else []
 
             def step(n: Tuple[Any, ...], st: Dict[str, str]) -> None:
+                """Extract a flow step's action, sinks, and environment bindings."""
                 for key, val in entries(n):
                     k = key.lower()
                     if k == "uses" and val[0] == "scalar":
@@ -1171,6 +1187,7 @@ class WorkflowInjectionScanner:
                             sub(ev, env_name=ek)
 
             def matrix_vars(n: Tuple[Any, ...]) -> None:
+                """Extract matrix variable bindings from a flow mapping."""
                 for key, val in entries(n):
                     sub(val, matrix_name=key.lower())
 
@@ -1279,7 +1296,7 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _assemble(cls, pieces: List[Tuple[int, bool, str]], decode: str = "") -> Tuple[str, List[int]]:
-        """The value's text, pieces joined by newlines (double-quoted escapes decoded), and piece offsets."""
+        """Join pieces with newlines and return the text and offsets; decode escapes when decode is 'double'."""
         parts = [cls._decode_double(t) if decode == "double" else t for _, _, t in pieces]
         offsets, pos = [], 0
         for p in parts:
@@ -1289,6 +1306,7 @@ class WorkflowInjectionScanner:
 
     @staticmethod
     def _slice(pieces: List[Tuple[int, bool, str]], offsets: List[int], s: int, e: int) -> List[Tuple[int, bool, str]]:
+        """Return the portions of pieces overlapping the half-open text span [s, e)."""
         out = []
         for (ln, added, text), off in zip(pieces, offsets):
             a, b = max(s, off), min(e, off + len(text))
@@ -1449,6 +1467,7 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _unquote(cls, s: str) -> str:
+        """Strip whitespace and matching YAML scalar quotes, decoding their escapes."""
         s = s.strip()
         if len(s) >= 2 and s[0] == s[-1] == '"':
             return cls._decode_double(s[1:-1])

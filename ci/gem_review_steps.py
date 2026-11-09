@@ -101,6 +101,11 @@ def resolve_commit(repo: str, ref: str) -> str:
 
 
 def cmd_diff(a: argparse.Namespace) -> int:
+    """Write per-file patches and a diff manifest from the merge base to HEAD.
+
+    The manifest records the resolved checkout path for the scan step. Raises StepError if the base
+    cannot be resolved or diffed; filesystem and subprocess errors, including timeouts, propagate.
+    """
     work = Path(a.work)
     (work / "patches").mkdir(parents=True, exist_ok=True)
     base_input = a.base or a.pr_base_sha
@@ -138,6 +143,11 @@ def cmd_diff(a: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- gemctl steps
 
 def _gemctl(gem: str, *args: str, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+    """Run gemctl with captured output, optionally in the PR checkout for workflow context.
+
+    Return the process result even on a nonzero exit. A missing script raises StepError; process startup
+    errors and subprocess.TimeoutExpired propagate.
+    """
     script = Path(gem).resolve() / "gemctl.py"
     if not script.is_file():
         raise StepError(f"gemctl.py not found in the gem checkout {json.dumps(gem)}")
@@ -149,6 +159,11 @@ def _gemctl(gem: str, *args: str, cwd: Optional[str] = None) -> subprocess.Compl
 
 
 def cmd_scan(a: argparse.Namespace) -> int:
+    """Scan each manifest patch and write the aggregated scan report.
+
+    Use the manifest's checkout as the working directory when it still exists. A failed scan raises
+    StepError; manifest, JSON, filesystem, and subprocess errors also propagate.
+    """
     work = Path(a.work)
     manifest = _load(work / "results" / "diff.json")
     head_dir = manifest.get("repo") if isinstance(manifest.get("repo"), str) and Path(manifest["repo"]).is_dir() else None

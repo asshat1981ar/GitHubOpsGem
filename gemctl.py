@@ -72,7 +72,9 @@ POST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
 def _post_image(path: str, patch_text: str) -> Optional[str]:
     """The workflow file at `path`, if the patch names its target blob (an `index <old>..<new>` line, as git
-    diff writes) and the file is a regular file on disk (no symlink) of sane size; else None.
+    diff writes) and the file is a regular file on disk (no symlink) of at most 2 MiB; else None.
+
+    File access and UTF-8 decoding errors also return None.
 
     audit_diff uses it only as YAML context for the CWE-94 rule, and only when it hashes to that blob and
     every context and added line of the patch appears in it at the same line number. A working tree that
@@ -93,6 +95,11 @@ def _post_image(path: str, patch_text: str) -> Optional[str]:
 
 
 def cmd_scan_diff(a: argparse.Namespace) -> int:
+    """Emit JSON findings for a patch, using an eligible workflow file as context when available.
+
+    Return 2 if fail_on_critical is set and a critical finding exists, otherwise 0. Patch read and
+    output errors propagate; an unreadable workflow context is ignored.
+    """
     patch = _read(a.patch)
     findings = gem.SupplyChainAndSecretScanner.audit_diff(a.path, patch, post_image=_post_image(a.path, patch))
     _emit({"path": a.path, "findings": findings,
