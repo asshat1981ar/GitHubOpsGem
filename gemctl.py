@@ -71,14 +71,13 @@ POST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _post_image(path: str, patch_text: str) -> Optional[str]:
-    """The workflow file at `path`, if the patch names its target blob (an `index <old>..<new>` line, as git
-    diff writes) and the file is a regular file on disk (no symlink) of at most 2 MiB; else None.
+    """Read a workflow file if the patch has a Git index line and the file is regular and at most 2 MiB.
 
-    File access and UTF-8 decoding errors also return None.
+    The final path component must not be a symlink. Return None for an ineligible path or patch, file
+    access errors, or UTF-8 decoding errors.
 
-    audit_diff uses it only as YAML context for the CWE-94 rule, and only when it hashes to that blob and
-    every context and added line of the patch appears in it at the same line number. A working tree that
-    differs from the patch's target (unstaged edits next to a staged patch) is therefore never used.
+    The caller checks the returned text against the patch's target blob prefix and visible lines before
+    using it as YAML context for the CWE-94 rule.
     """
     if not gem.SupplyChainAndSecretScanner.WORKFLOW_PATH_RE.search(path):
         return None

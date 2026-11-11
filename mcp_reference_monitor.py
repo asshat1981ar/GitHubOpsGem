@@ -435,7 +435,7 @@ class UntrustedContextPolicy:
 
     @staticmethod
     def _closers(toks: List[str]) -> Dict[int, int]:
-        """Index of each '(' / '[' -> index of its matching closer."""
+        """Map each paired opener index to its closer, pairing the most recent opener regardless of type."""
         match: Dict[int, int] = {}
         stack: List[int] = []
         for i, t in enumerate(toks):
@@ -450,7 +450,8 @@ class UntrustedContextPolicy:
         """Context paths an expression reads, e.g. `github.event.commits.*.message` (as written; contexts
         are case-insensitive, so compare them lower-cased).
 
-        `x['key']` becomes `x.key`; `x[0]` and `x[<expr>]` become `x.*` (the inner expression is read too).
+        `x['key']` becomes `x.key` for an identifier key; other subscripts become `x.*` (the inner
+        expression is read too).
         String literals and function names are not contexts. Duplicate paths are collapsed case-insensitively.
         """
         toks = cls._tokens(expr)
@@ -615,9 +616,11 @@ class _FlowParser:
     MAX_DEPTH = 64
 
     def __init__(self, text: str) -> None:
+        """Initialize parsing at the start of the supplied flow text."""
         self.t, self.i = text, 0
 
     def _ws(self) -> None:
+        """Advance past whitespace and YAML comments at the current position."""
         t = self.t
         while self.i < len(t):
             c = t[self.i]
@@ -765,7 +768,8 @@ class WorkflowInjectionScanner:
         """Find unsafe expression expansions in execution sinks touching added patch lines.
 
         Use post_image for context when it matches the patch; otherwise scan the available hunks.
-        Findings are critical, grouped by added line, and ordered by line number.
+        An added sink alias whose anchor is outside a partial diff is also reported. Findings are critical,
+        grouped by added line, and ordered by line number.
         """
         segments, whole_file = cls._segments(patch_text, post_image)
         values: List[_Value] = []
@@ -819,7 +823,10 @@ class WorkflowInjectionScanner:
 
     @classmethod
     def _post_image_is_target(cls, patch_text: str, post_image: str) -> bool:
-        """When the patch names its target blob (`index <old>..<new>`), the post-image must hash to it."""
+        """Compare a post-image's Git blob hash prefix with the patch's target, if an index line exists.
+
+        Return True without a recognized index line. UTF-8 encoding errors propagate.
+        """
         header = patch_text.split("\n@@", 1)[0] if not patch_text.startswith("@@") else ""
         m = cls.INDEX_RE.search(header)
         if m is None:
@@ -1166,9 +1173,11 @@ class WorkflowInjectionScanner:
                 out.append(_Value(style=style, pieces=cls._slice(v.pieces, offsets, s, e), **kw))
 
             def entries(n: Tuple[Any, ...]) -> List[Tuple[str, Tuple[Any, ...]]]:
+                """Return mapping entries, or an empty list for other node kinds."""
                 return n[1] if n[0] == "map" else []
 
             def items(n: Tuple[Any, ...]) -> List[Tuple[Any, ...]]:
+                """Return sequence items, or an empty list for other node kinds."""
                 return n[1] if n[0] == "seq" else []
 
             def step(n: Tuple[Any, ...], st: Dict[str, str]) -> None:
@@ -1456,6 +1465,7 @@ class WorkflowInjectionScanner:
     def _decode_double(cls, s: str) -> str:
         """YAML double-quoted escapes (\\x24, \\u0024, \\U00000024, \\n, ...) decoded; unknown ones kept."""
         def one(m: "re.Match[str]") -> str:
+            """Decode a recognized escape, retaining invalid or unknown escapes as written."""
             e = m.group(1)
             if e[0] in "xuU" and len(e) > 1:
                 try:
@@ -1529,10 +1539,10 @@ class SupplyChainAndSecretScanner:
     def audit_diff(cls, file_path: str, patch_text: str, post_image: Optional[str] = None) -> List[InlineFinding]:
         """Findings on the added lines of one file's unified diff.
 
-        post_image: optional full text of the file after the change. It is used only to give the CWE-94
-        rule the YAML context of each added line, and only when it is the patch's target (it hashes to the
-        blob on the patch's `index` line, if there is one) and matches every context and added line of the
-        patch; otherwise the rule works from the patch alone.
+        post_image: optional full text used as YAML context for the CWE-94 rule. It must match every
+        context and added line in the patch and, when a recognized `index` line exists, its Git blob hash
+        must start with the target hash there. Otherwise the rule works from the patch alone. With an
+        index line, UTF-8 encoding errors in post_image propagate.
         """
         findings: List[InlineFinding] = []
         is_workflow = bool(cls.WORKFLOW_PATH_RE.search(file_path))
