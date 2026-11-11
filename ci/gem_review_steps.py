@@ -3,7 +3,9 @@
 
 The workflow (ci/gem-review.yml, installed as .github/workflows/gem-review.yml) runs this file from the
 gem checkout, so the code that reviews a pull request always comes from the pinned gem_ref and never
-from the pull request. Stdlib only. Nothing in the repository under review is executed: it is diffed
+from the pull request. This file is stdlib only; gemctl's workflow scanner needs PyYAML, which the workflow
+installs hash-checked from ci/requirements-gem-review.txt (the scan step fails without it). Nothing in the
+repository under review is executed: it is diffed
 with git and read by gemctl, nothing more. All state lives under --work:
 
   <work>/patches/NNNN.patch  one unified diff per changed file, plus all.patch (not uploaded)
@@ -158,6 +160,20 @@ def _gemctl(gem: str, *args: str, cwd: Optional[str] = None) -> subprocess.Compl
                           timeout=TIMEOUT_S, check=False, cwd=cwd)
 
 
+def _require_yaml() -> None:
+    """Raise StepError unless the interpreter that runs gemctl (`-I`) can import PyYAML.
+
+    gemctl's CWE-94 rule parses a changed workflow file with PyYAML and, without it, falls back to
+    line heuristics (failing closed). In this workflow the parser is always meant to be there, installed
+    hash-checked from ci/requirements-gem-review.txt, so its absence is an error, not a quieter scan.
+    """
+    proc = subprocess.run([sys.executable, "-I", "-c", "import yaml; yaml.SafeLoader"], capture_output=True,
+                          text=True, timeout=TIMEOUT_S, check=False)
+    if proc.returncode != 0:
+        raise StepError("PyYAML is not importable; install it with pip --require-hashes -r "
+                        f"ci/requirements-gem-review.txt first: {json.dumps(proc.stderr[-200:])}")
+
+
 def cmd_scan(a: argparse.Namespace) -> int:
     """Scan each manifest patch and write the aggregated scan report.
 
@@ -166,6 +182,7 @@ def cmd_scan(a: argparse.Namespace) -> int:
     """
     work = Path(a.work)
     manifest = _load(work / "results" / "diff.json")
+    _require_yaml()
     head_dir = manifest.get("repo") if isinstance(manifest.get("repo"), str) and Path(manifest["repo"]).is_dir() else None
     by_sev = {s: 0 for s in SEVERITIES}
     out: List[Dict[str, Any]] = []

@@ -24,6 +24,7 @@
 #   - no expression is expanded inside `run:`; every value reaches the shell through `env:`
 #   - actions/checkout runs with persist-credentials: false; every job sets timeout-minutes
 #   - one concurrency group per PR; the PR's code is diffed and read, never executed
+#   - the one PyPI dependency (PyYAML) is installed with pip --require-hashes from the gem checkout
 #
 # Pinned actions (tags resolved with `git ls-remote --tags`; all three are lightweight tags, so the
 # tag SHA is the commit SHA):
@@ -118,6 +119,14 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+
+      # The CWE-94 scanner parses changed workflow files with PyYAML. Version and sha256 of every wheel are
+      # pinned in the gem checkout (never the PR's); wheels only, so no setup.py runs. If this step is
+      # removed, the scan step fails instead of scanning without the parser.
+      - name: Install the scanner's pinned dependency (PyYAML, hash-checked)
+        run: |
+          python -I -m pip install --disable-pip-version-check --no-input --require-hashes \
+            --only-binary=:all: --no-deps -r gem/ci/requirements-gem-review.txt
 
       - name: Compute the diff against the merge base
         env:
