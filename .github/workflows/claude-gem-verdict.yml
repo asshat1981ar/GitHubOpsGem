@@ -1,0 +1,123 @@
+# When "gem-review / scan" fails on a pull request, Claude adjudicates each CRITICAL finding
+# (true or false positive) and proposes a regression test. It never changes the required check;
+# the owner decides. The result is typed with --json-schema (structured_output).
+# The deterministic CRITICAL count from gem-review.json is the verdict; Claude only adds explanation.
+# Claude reads the results directory and the PR diff only (no PR comments, no PR code is executed).
+# The results artifact is produced by the PR-head scan, so its JSON is attacker-influenced data (same-repo branches
+# only); Claude holds no write token, and only the separate `label` job can write (one fixed label).
+name: claude-gem-verdict
+on:
+  # zizmor: ignore[dangerous-triggers] -- base-branch checkout only; PR code is never executed; artifact is JSON read as data
+  workflow_run:
+    workflows: ["gem-review"]
+    types: [completed]
+permissions: {}
+jobs:
+  verdict:
+    if: |
+      vars.CLAUDE_PAUSE != 'true' &&
+      github.event.workflow_run.actor.login != 'dependabot[bot]' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ${{ vars.CLAUDE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    concurrency:
+      group: claude-gem-verdict-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: true
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
+    outputs:
+      fp_candidate: ${{ steps.summary.outputs.fp_candidate }}
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read # gh pr diff
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Fetch gem-review results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run download "$RUN_ID" -n gem-review-results -D "$RUNNER_TEMP/gem-results"
+      - name: Adjudicate the findings
+        id: verdict
+        continue-on-error: true # a Claude failure (for example the subscription limit) must not hide the fallback summary
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: "/explain-gem-verdict RESULTS_DIR: ${{ runner.temp }}/gem-results RUN_ID: ${{ github.event.workflow_run.id }} PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}"
+          claude_args: |
+            --permission-mode auto
+            --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
+            --max-turns 15
+            --add-dir ${{ runner.temp }}/gem-results
+            --allowedTools "Read,Glob,Grep,Bash(gh pr diff:*)"
+            --disallowedTools "Edit,MultiEdit,Write,WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh search:*),Bash(gh api:*),Bash(gh pr comment:*)"
+            --json-schema '{"type":"object","required":["verdict","findings"],"properties":{"verdict":{"enum":["true_positive","false_positive","mixed","needs_human"]},"findings":{"type":"array","items":{"type":"object","required":["path","line","category","assessment","reason"],"properties":{"path":{"type":"string"},"line":{"type":"integer"},"category":{"type":"string"},"assessment":{"enum":["tp","fp","unsure"]},"reason":{"type":"string"},"fix_hint":{"type":"string"}}}},"scanner_gap":{"type":"string"},"regression_test":{"type":"string"},"fmea_rpn":{"type":"integer","minimum":1,"maximum":1000}}}'
+      - name: Summarise
+        id: summary
+        if: ${{ !cancelled() }}
+        env:
+          VERDICT_JSON: ${{ steps.verdict.outputs.structured_output }}
+        run: |
+          # The deterministic CRITICAL count is the verdict. Claude only explains it. Empty or invalid
+          # Claude output is "no Claude verdict" (WARN), never a pass.
+          crit=""
+          if [ -f "$RUNNER_TEMP/gem-results/gem-review.json" ]; then
+            crit=$(jq -r '.totals.critical // empty' "$RUNNER_TEMP/gem-results/gem-review.json" 2>/dev/null || true)
+          fi
+          case "$crit" in ''|*[!0-9]*) crit="unknown" ;; esac
+          claude_ok=true
+          if [ -z "$VERDICT_JSON" ] || ! jq -e .verdict >/dev/null 2>&1 <<<"$VERDICT_JSON"; then claude_ok=false; fi
+          {
+            if [ "$crit" = "unknown" ]; then
+              echo "## gem-review verdict: WARN (scan results unreadable)"
+            elif [ "$crit" -gt 0 ]; then
+              echo "## gem-review verdict: FAIL ($crit CRITICAL finding(s), deterministic)"
+            else
+              echo "## gem-review verdict: WARN (scan failed with 0 CRITICAL; check other findings)"
+            fi
+            echo
+            if [ "$claude_ok" = false ]; then
+              echo "WARN: no Claude verdict (limit hit, error or cancelled). The deterministic result above stands; the required check is unchanged."
+              echo
+              echo "Result files from the failed scan:"
+              for f in "$RUNNER_TEMP"/gem-results/*.json; do [ -e "$f" ] && echo "- $(basename "$f")"; done
+              exit 0
+            fi
+            echo "Claude assessment (advisory): $(jq -r .verdict <<<"$VERDICT_JSON")"
+            echo
+            echo "| path | line | category | assessment | reason |"
+            echo "|---|---|---|---|---|"
+            jq -r '.findings[] | "| \(.path) | \(.line) | \(.category) | \(.assessment) | \(.reason | gsub("[|\n]"; " ")) |"' <<<"$VERDICT_JSON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$claude_ok" = true ]; then
+            v=$(jq -r .verdict <<<"$VERDICT_JSON")
+            if [ "$v" = "false_positive" ] || [ "$v" = "mixed" ]; then
+              echo "fp_candidate=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+  label:
+    # Separate job so Claude's token never holds pull-requests: write. Only the deterministic label lives here.
+    needs: verdict
+    if: ${{ !cancelled() && needs.verdict.outputs.fp_candidate == 'true' }}
+    runs-on: ${{ vars.CLAUDE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    concurrency:
+      group: claude-gem-label-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: true
+    permissions:
+      pull-requests: write # gh pr edit --add-label
+    steps:
+      - name: Add the false-positive candidate label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: gh pr edit "$PR" --add-label gem-review:fp-candidate || echo "::warning::could not add label gem-review:fp-candidate"

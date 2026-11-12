@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [],
+    "deny": [
+      "Read(./.env*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/*.jks)",
+      "Read(**/secrets/**)",
+      "Read(./gateway/claude-gem.env)",
+      "Read(./lifecycle/lifecycle.env)",
+      "Read(/etc/gem/**)",
+      "Read(~/.gem/**)",
+      "Bash(python3 -I gemctl.py heavy:*)",
+      "Bash(firectl:*)",
+      "Bash(sudo:*)",
+      "Bash(git push --force*)",
+      "Read(./.git/config)",
+      "Read(./.git/**)"
+    ]
+  }
+}

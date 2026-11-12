@@ -1,0 +1,98 @@
+# @claude in issues, PR comments and PR reviews (tag mode). Owner-only on a public repository.
+# Prerequisites and switches: docs/claude-automation.md
+# Trust model: tag mode may check out the PR head, so (1) cross-repository PRs are refused (fork step and
+# the review-event if:), (2) no build, test, package-manager or repo-script command is allowlisted (only
+# read-only git/gh; edits use the action's file tools), (3) CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 strips
+# secrets from subprocesses. Claude cannot run tests here; once a PR exists, gem-review runs on it without secrets.
+# (4) gh pr view / gh issue view / gh api are denied: they return comments that bypass the actor filters.
+# Residual risk: a same-repo branch the owner points Claude at is read as data, and the Claude process
+# itself still holds the tokens.
+name: claude
+on:
+  issue_comment: # zizmor: ignore[dangerous-triggers] -- owner-gated trigger; cross-repo PRs refused by the fork step; no PR code executed (no build/test tools allowlisted); env scrub on
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+permissions: {}
+jobs:
+  claude:
+    # Bare block, no template expressions inside (gem CWE-94 rule). Owner-only is defence in depth:
+    # the action also re-checks write access.
+    if: |
+      vars.CLAUDE_PAUSE != 'true' &&
+      github.actor != 'dependabot[bot]' &&
+      github.actor == github.repository_owner && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    runs-on: ${{ vars.CLAUDE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # push fix/<n>-<slug> branches
+      pull-requests: write
+      issues: write
+      actions: read # mcp__github_ci__* tools
+      id-token: write # Claude GitHub App token exchange (OIDC)
+    steps:
+      - name: Refuse cross-repository pull requests
+        id: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number || github.event.pull_request.number }}
+          IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
+        run: |
+          # Fail closed: any error or unexpected answer means cross=true. Plain issues are never cross-repo.
+          # PRs whose head is a protected ref (main, master, prod*, trunk, release/*, hotfix/*) are refused too:
+          # tag mode pushes to the PR head branch.
+          cross=true
+          if [ "$IS_PR" != "true" ]; then
+            cross=false
+          elif out=$(gh pr view "$PR" --repo "$REPO" --json isCrossRepository,headRefName -q '"\(.isCrossRepository) \(.headRefName)"' 2>/dev/null); then
+            flag="${out%% *}"
+            ref="${out#* }"
+            case "$flag" in
+              true) cross=true ;;
+              false)
+                cross=false
+                case "$ref" in main|master|prod*|trunk|release/*|hotfix/*) cross=true ;; esac
+                ;;
+            esac
+          fi
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+          [ "$cross" = "true" ] && echo "::warning::cross-repository, protected-ref or unverifiable PR; Claude was not started"
+          exit 0
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run Claude
+        if: steps.fork.outputs.cross != 'true'
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          branch_prefix: "fix/"
+          branch_name_template: "{{prefix}}{{entityNumber}}-{{description}}"
+          include_comments_by_actor: "asshat1981ar,coderabbitai[bot]"
+          exclude_comments_by_actor: "dependabot[bot],renovate[bot]"
+          claude_args: |
+            --permission-mode auto
+            --model ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
+            --max-turns 40
+            --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*)"
+            --disallowedTools "WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh search:*),Bash(git diff --no-index:*),Bash(git diff --output:*),Bash(git log --output:*),Bash(git show --output:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(bash:*),Bash(sh:*),Bash(make:*),Bash(python3 -I gemctl.py gate:*),Bash(python3 -I gemctl.py heavy:*),Bash(python3 -I gemctl.py trailer:*),Bash(python3 install_hooks.py:*),Bash(sudo:*),Bash(bash lifecycle/deploy_awsbox.sh:*),Bash(./lifecycle/deploy_awsbox.sh:*),Bash(bash ci/apply_rulesets.sh:*),Bash(gh api:*),Bash(git push --force*)"
+            --append-system-prompt "CI context: GitHub Actions, no ForgeCore, no gem hooks, no B200. You cannot run tests, scripts or package managers here: gem-review runs on a PR for your branch (without secrets) once one exists. Never run gemctl gate/heavy/trailer, never edit .github/workflows/gem-review.yml or ci/gem-review.yml (they must stay byte-identical), never touch ci/rulesets/main.json. Branches are fix/<issue>-<slug>. Never push to main, master, prod*, trunk, release/* or hotfix/*."
