@@ -216,7 +216,7 @@ def test_script_passes_shellcheck():
     if not sc:
         pytest.skip("shellcheck not installed")
     r = subprocess.run([sc, "-S", "style", SCRIPT], capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 @needs_root

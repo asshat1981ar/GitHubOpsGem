@@ -433,7 +433,8 @@ def test_installed_reusable_workflow_is_the_tested_source():
 
 def test_self_caller_is_hardened_and_reviews_with_the_base_commit():
     w = load(SELF_CALLER)
-    assert set(w[True]) == {"pull_request"} and "pull_request_target" not in SELF_CALLER.read_text()
+    assert set(w[True]) == {"pull_request"} and w[True]["pull_request"] is None   # every PR
+    assert "pull_request_target" not in SELF_CALLER.read_text()
     assert w["permissions"] == {"contents": "read", "pull-requests": "read"}
     (name, job), = jobs(w)
     assert job["uses"] == "./.github/workflows/gem-review.yml"   # same commit as the caller (see file comment)
@@ -450,7 +451,9 @@ def test_ruleset_requires_the_check_that_actually_runs():
     expected = f"{caller_job} / {callee_job}"
     main = json.loads((ROOT / "ci" / "rulesets" / "main.json").read_text())
     checks = [r for r in main["rules"] if r["type"] == "required_status_checks"][0]["parameters"]["required_status_checks"]
-    assert checks == [{"context": expected, "integration_id": 15368}]          # 15368 = GitHub Actions
+    assert checks[0] == {"context": expected, "integration_id": 15368}          # 15368 = GitHub Actions
+    tests_job = load(ROOT / ".github" / "workflows" / "tests.yml")["jobs"]["pytest"]["name"]
+    assert checks[1:] == [{"context": tests_job, "integration_id": 15368}]
     types = {r["type"] for r in main["rules"]}
     assert {"deletion", "non_fast_forward", "pull_request", "required_status_checks"} <= types
     assert all(b["bypass_mode"] == "pull_request" for b in main["bypass_actors"])  # no direct-push bypass
@@ -460,9 +463,29 @@ def test_ruleset_requires_the_check_that_actually_runs():
 
 
 def test_new_workflow_files_pass_actionlint_and_zizmor():
-    files = [str(INSTALLED), str(SELF_CALLER)]
+    files = sorted(str(p) for p in (ROOT / ".github" / "workflows").glob("*.yml"))
+    assert len(files) == 3
     r = subprocess.run([_tool("actionlint"), "-no-color", *files], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
                        text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_tests_workflow_is_hardened():
+    w = load(ROOT / ".github" / "workflows" / "tests.yml")
+    assert w["permissions"] == {"contents": "read"} and "pull_request_target" not in str(w[True])
+    job = w["jobs"]["pytest"]
+    assert job["permissions"] == {"contents": "read"} and 0 < job["timeout-minutes"] <= 30
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", step["uses"]), step["uses"]
+        if "run" in step:
+            assert "${{" not in step["run"]
+            if "pip install" in step["run"]:
+                args = step["run"].split("install", 1)[1].split()
+                pkgs = [a for a in args if not a.startswith("-")]
+                assert pkgs and all(re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][0-9A-Za-z.]*", p) for p in pkgs), pkgs
+    checkouts = [s for s in job["steps"] if "actions/checkout" in s.get("uses", "")]
+    assert checkouts and all(s.get("with", {}).get("persist-credentials") is False for s in checkouts)
+    assert set(w[True]) == {"pull_request", "push"} and w[True]["pull_request"] is None   # every PR

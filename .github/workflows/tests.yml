@@ -1,0 +1,39 @@
+# Full test suite on every PR to main and on main itself. Required by the "main protection" ruleset as the
+# status check "pytest". The deploy end-to-end tests need root (they create the `gem` service user), so they run
+# under sudo in their own step; nothing in either step executes code other than this repository's tests.
+name: tests
+on:
+  pull_request: # every PR: the ruleset targets the default branch, whatever it is called
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }} # refs/pull/<n>/merge on PRs: one group per PR
+  cancel-in-progress: true
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned test tools
+        run: >-
+          python -m pip install --disable-pip-version-check --no-cache-dir
+          pytest==9.1.1 PyYAML==6.0.3 litellm==1.108.2 actionlint-py==1.7.12.25
+          zizmor==1.32.0 shellcheck-py==0.11.0.1
+      - name: Tests
+        run: python -m pytest -q --ignore=tests/test_deploy.py
+      - name: Deploy end-to-end tests (root)
+        # sudo resets PATH (secure_path); keep the pinned toolchain (shellcheck-py etc.) instead of the system one
+        run: sudo -E env "PATH=$PATH" "$(command -v python)" -m pytest -q tests/test_deploy.py
