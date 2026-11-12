@@ -1,0 +1,78 @@
+name: Candidate scanner verification
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-scanner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Candidate scanner (Linux)
+    if: github.head_ref == 'fix/cwe94-precision-verification' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: >-
+          python -I -m pip install --disable-pip-version-check --no-input
+          pytest==9.2.0 litellm==1.108.2 actionlint-py==1.7.12.25
+          zizmor==1.32.0 shellcheck-py==0.11.0.1
+      - name: Install hash-pinned scanner dependency
+        run: >-
+          python -I -m pip install --disable-pip-version-check --no-input --require-hashes --force-reinstall
+          --only-binary=:all: --no-deps -r ci/requirements-gem-review.txt
+      - name: Verify candidate and run suite
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git rev-parse HEAD
+          python -m pytest -q -rs
+
+  windows:
+    name: Candidate scanner (Windows)
+    if: github.head_ref == 'fix/cwe94-precision-verification' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: python -I -m pip install --disable-pip-version-check --no-input pytest==9.2.0
+      - name: Install hash-pinned scanner dependency
+        run: >-
+          python -I -m pip install --disable-pip-version-check --no-input --require-hashes --force-reinstall
+          --only-binary=:all: --no-deps -r ci/requirements-gem-review.txt
+      - name: Verify candidate and run scanner cases
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:CANDIDATE_SHA) { throw "Candidate SHA mismatch" }
+          Write-Output $actual
+          python -m pytest -q tests/test_cwe94_yaml.py -k changed_workflow
