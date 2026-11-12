@@ -16,6 +16,7 @@
 | `gateway/gem_lifecycle_callback.py` | LiteLLM callback: ds-burst traffic keeps the B200 awake, ds-main 429 storms wake it |
 | `gateway/gem_guardrail.py` | LiteLLM guardrail: strips `<think>` from streamed and non-streamed output on `/v1/messages` and `/chat/completions` (WU-05) |
 | `.github/workflows/gem-review.yml`, `gem-review-pr.yml` | Reusable server-side review (scan-diff + debt, read-only, SHA-pinned) and this repo's own PR check |
+| `ci/requirements-gem-review.txt` | The review workflow's one PyPI dependency (PyYAML, exact version, sha256 of every wheel); installed with `pip --require-hashes`. The CWE-94 scanner parses whole workflow files with it and falls back to fail-closed line heuristics without it |
 | `ci/rulesets/*.json`, `ci/apply_rulesets.sh` | Branch + tag rulesets; the owner applies them with `gh` |
 | `state/SELF_PROMPT.md` | Standing directive for autonomous runs (loop, guardrails, self-correction checklist) |
 | `gem_lifecycle_client.py` | Client used by `gemctl heavy` and the session hooks |
