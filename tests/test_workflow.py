@@ -542,6 +542,14 @@ def test_sim_runs_the_pinned_install_from_the_gem_checkout(tmp_path, repo):
     assert (sim["gem"] / "ci" / "requirements-gem-review.txt").read_bytes() == REQUIREMENTS.read_bytes()
 
 
+def test_workflow_install_allows_a_trusted_checkout_without_a_manifest(tmp_path):
+    (tmp_path / "gem").mkdir()
+    (install,) = [s for s in steps(load(REUSABLE)) if "pip" in s.get("run", "")]
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", install["run"]], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
 def test_scan_step_fails_closed_without_pyyaml(tmp_path, monkeypatch):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gem_review_steps_under_test", HELPER)

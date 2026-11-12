@@ -120,13 +120,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The CWE-94 scanner parses changed workflow files with PyYAML. Version and sha256 of every wheel are
-      # pinned in the gem checkout (never the PR's); wheels only, so no setup.py runs. If this step is
-      # removed, the scan step fails instead of scanning without the parser.
+      # Older trusted scanner revisions predate PyYAML. Newer revisions require the parser at scan time
+      # and pin the wheel hashes in the trusted checkout.
       - name: Install the scanner's pinned dependency (PyYAML, hash-checked)
         run: |
-          python -I -m pip install --disable-pip-version-check --no-input --require-hashes \
-            --only-binary=:all: --no-deps -r gem/ci/requirements-gem-review.txt
+          if [ -f gem/ci/requirements-gem-review.txt ]; then
+            python -I -m pip install --disable-pip-version-check --no-input --require-hashes \
+              --only-binary=:all: --no-deps -r gem/ci/requirements-gem-review.txt
+          fi
 
       - name: Compute the diff against the merge base
         env:

@@ -6,6 +6,7 @@ patch-only mode the heuristics stay and fail closed. Each test names the review 
 parametrised ones run both modes ("heuristic": patch only, "yaml": whole file parsed).
 """
 import os
+import subprocess
 import sys
 
 import pytest
@@ -25,6 +26,67 @@ def scan(text, mode, path=WF):
 
 def sink_line(text, needle="${{"):
     return _line_of(text, needle)
+
+
+@pytest.mark.parametrize(("head", "unsafe", "expected_line"), [
+    (WF_HEAD + '      - run: |\n          echo "${{\n          github.event.issue.title\n          }}"\n',
+     "issue.title", len(WF_HEAD.splitlines()) + 3),
+    (WF_HEAD.replace("    steps:", "    env:\n      TITLE: ${{ github.event.issue.title }}\n    steps:")
+     + '      - run: echo "${{ env.TITLE }}"\n        env:\n          title: fixed\n',
+     "issue.title", len(WF_HEAD.splitlines()) + 1),
+    (WF_HEAD.replace("    steps:", "    env:\n      TITLE: fixed\n    steps:")
+     + '      - run: echo "TITLE=$T" >> "$GITHUB_ENV"\n        env:\n'
+       '          T: ${{ github.event.issue.body }}\n      - run: echo "${{ env.COPY }}"\n'
+       '        env:\n          COPY: ${{ env.TITLE }}\n',
+     "issue.body", len(WF_HEAD.splitlines()) + 5),
+    (WF_HEAD + '      - run: echo "LABEL=$T" >> "$GITHUB_ENV"\n        env:\n'
+       '          T: ${{ github.event.issue.body }}\n      - run: echo "${{ env.PAYLOAD }}"\n',
+     "issue.body", len(WF_HEAD.splitlines()) + 3),
+    ((WF_HEAD + '      - run: echo "${{ github.event.issue.title }}"\n').replace("\n", "\r"),
+     "issue.title", 1),
+], ids=["multiline-interior", "case-distinct-env", "runtime-derived-env", "runtime-extra-record", "cr-only"])
+def test_changed_workflow_reports_injection(tmp_path, head, unsafe, expected_line):
+    assert scan_changed_workflow(tmp_path, head.replace(unsafe, "issue.number"), head) == [(expected_line, *CWE94)]
+
+
+def scan_changed_workflow(tmp_path, base, head):
+    (tmp_path / "base.yml").write_bytes(base.encode())
+    (tmp_path / "head.yml").write_bytes(head.encode())
+    diff = subprocess.run(["git", "diff", "--no-index", "--", "base.yml", "head.yml"],
+                          cwd=tmp_path, capture_output=True)
+    assert diff.returncode == 1, diff.stderr
+    return _found(WF, diff.stdout.decode().replace("\r", " "), post_image=head)
+
+
+@pytest.mark.parametrize(("runner", "binding", "unsafe"), [
+    ("ubuntu-latest", "PAYLOAD", True),
+    ("ubuntu-latest", "payload", False),
+    ("windows-latest", "payload", True),
+    ("windows-latest", "VERSION", False),
+    ("${{ matrix.os }}", "payload", True),
+], ids=["linux-exact", "linux-distinct", "windows-folded", "windows-benign", "dynamic-runner"])
+def test_changed_workflow_resolves_environment_names_for_runner(tmp_path, runner, binding, unsafe):
+    prelude = WF_HEAD.replace("ubuntu-24.04", runner).replace(
+        "    steps:\n", "    env:\n      PAYLOAD: ${{ github.event.issue.title }}\n"
+        "      VERSION: fixed\n    steps:\n")
+    sink = '      - run: echo "${{ env.' + binding + ' }}"\n'
+    expected = [(len(prelude.splitlines()) + 1, *CWE94)] if unsafe else []
+    assert scan_changed_workflow(tmp_path, prelude + "      - run: echo fixed\n", prelude + sink) == expected
+
+
+@pytest.mark.parametrize(("write", "step_env", "unsafe"), [
+    ('echo "LABEL=$T" >> "$GITHUB_ENV"', "", True),
+    ('echo "LABEL=$T" >> "$GITHUB_ENV"', "        env:\n          PAYLOAD: fixed\n", False),
+    ('echo "VERSION=1.2.3" >> "$GITHUB_ENV"', "", False),
+], ids=["injected-record", "safe-step-override", "constant-write-with-unrelated-taint"])
+def test_changed_workflow_tracks_runtime_environment_records(tmp_path, write, step_env, unsafe):
+    prelude = WF_HEAD + (
+        "      - env:\n          T: ${{ github.event.issue.body }}\n"
+        f"        run: {write}\n")
+    base = prelude + "      - run: echo fixed\n" + step_env
+    head = prelude + '      - run: echo "${{ env.PAYLOAD }}"\n' + step_env
+    expected = [(len(prelude.splitlines()) + 1, *CWE94)] if unsafe else []
+    assert scan_changed_workflow(tmp_path, base, head) == expected
 
 
 # ------------------------------------------------------------------ line endings (4507449480, 4507449491)

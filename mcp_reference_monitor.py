@@ -454,11 +454,10 @@ class UntrustedContextPolicy:
 
     @classmethod
     def contexts(cls, expr: str) -> List[str]:
-        """Context paths an expression reads, e.g. `github.event.commits.*.message` (as written; contexts
-        are case-insensitive, so compare them lower-cased).
+        """Context paths an expression reads, e.g. `github.event.commits.*.message`, as written.
 
         `x['key']` becomes `x.key`; `x[0]` and `x[<expr>]` become `x.*` (the inner expression is read too).
-        String literals and function names are not contexts. Duplicate paths are collapsed case-insensitively.
+        String literals and function names are not contexts. Environment names retain their case.
         """
         toks = cls._tokens(expr)
         closer = cls._closers(toks)
@@ -483,7 +482,9 @@ class UntrustedContextPolicy:
             if j < len(toks) and toks[j] == "(":
                 continue  # function call: toJSON(...), format(...)
             ctx = ".".join(parts)
-            found.setdefault(ctx.lower(), ctx)
+            key = "env." + parts[1] + "".join("." + p.lower() for p in parts[2:]) \
+                if parts[0].lower() == "env" and len(parts) > 1 else ctx.lower()
+            found.setdefault(key, ctx)
         return list(found.values())
 
     @classmethod
@@ -735,6 +736,9 @@ class _Alias:
         self.target, self.line = target, line
 
 
+YAML_LINE_BREAK = re.compile(r"\r\n|[\r\n\x85\u2028\u2029]")
+
+
 class _Text:
     """One scalar of the file: its decoded text, the source lines it spans, and the aliases it was reached by."""
     __slots__ = ("text", "first", "last", "literal", "via", "src")
@@ -743,7 +747,7 @@ class _Text:
                  src: Optional[List[str]] = None) -> None:
         self.text, self.first, self.last, self.literal, self.via, self.src = text, first, last, literal, via, src
 
-    def line(self, offset: int, added: Set[int]) -> Optional[int]:
+    def line(self, offset: int, end: int, added: Set[int]) -> Optional[int]:
         """The added line a finding for the text at `offset` goes to: the alias that brought the text in, else
         the source line of the expression (exact in a literal block; found by counting `{{` in the raw lines
         of other multi-line scalars, whose escapes and folding shift offsets), else the first added line of
@@ -753,7 +757,8 @@ class _Text:
                 return ln
         if self.literal:
             ln = self.first + 1 + self.text.count("\n", 0, offset)
-            return ln if ln in added else None
+            last = ln + self.text.count("\n", offset, end)
+            return next((n for n in range(ln, last + 1) if n in added), None)
         start = self.first
         if self.src is not None and self.last > self.first:
             nth = self.text.count("${{", 0, offset)
@@ -783,27 +788,15 @@ class _Bind:
 
 
 class _Step:
-    __slots__ = ("chain", "matrix", "sinks", "run_texts", "writes_env", "reads_event_file")
+    __slots__ = ("chain", "matrix", "bindings", "sinks", "run_texts", "writes_env", "reads_event_file")
 
-    def __init__(self, chain: List[Dict[str, List[int]]], matrix: Dict[str, List[int]]) -> None:
+    def __init__(self, chain: List[Dict[str, List[int]]], matrix: Dict[str, List[int]], bindings: range) -> None:
         self.chain, self.matrix = chain, matrix
+        self.bindings = bindings
         self.sinks: List[Tuple[str, _Text]] = []
         self.run_texts: List[_Text] = []
         self.writes_env = False
         self.reads_event_file = False
-
-
-class _GhEnv:
-    """What earlier steps of a job may have written to $GITHUB_ENV."""
-    __slots__ = ("names", "wild", "line")
-
-    def __init__(self) -> None:
-        self.names: Set[str] = set()
-        self.wild = False
-        self.line: Optional[int] = None
-
-    def __bool__(self) -> bool:
-        return self.wild or bool(self.names)
 
 
 def _propagate(n: int, users: Dict[int, List[int]], direct: List[int]) -> Tuple[List[bool], List[int]]:
@@ -840,11 +833,17 @@ class _YamlScan:
     MAX_VISITS = 200_000
     MAX_DEPTH = 64
     MERGE_TAG = "tag:yaml.org,2002:merge"
-    GH_ENV_NAME_RE = re.compile(r"(?<![\w$])([A-Za-z_][A-Za-z0-9_]*)(?:=|<<)")
+    HOSTED_RUNNER = re.compile(r"(windows|ubuntu|macos)-(?:latest|\d+(?:\.\d+)?)(?:-arm64)?")
+    LITERAL_ENV_WRITE = re.compile(r'echo "[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_. -]*"[ \t]+>>[ \t]+"\$GITHUB_ENV"')
 
-    def __init__(self, yaml: Any, text: str, added: Set[int]) -> None:
-        self.y, self.text, self.added = yaml, text, added
-        self.lines = text.split("\n")
+    def __init__(self, yaml: Any, text: str, added: Set[int], *, fold_env: bool = False) -> None:
+        self.y, self.text = yaml, text
+        self.fold_env = fold_env
+        self.lines = YAML_LINE_BREAK.split(text)
+        self.git_lines = [1]
+        for match in YAML_LINE_BREAK.finditer(text):
+            self.git_lines.append(self.git_lines[-1] + match.group().endswith("\n"))
+        self.added = {line for line, git_line in enumerate(self.git_lines, 1) if git_line in added}
         self.visits = 0
         self.binds: List[_Bind] = []
         self.jobs: List[List[_Step]] = []
@@ -875,8 +874,9 @@ class _YamlScan:
             return node.target, via + (node.line,)
         return node, via
 
-    def _entries(self, node: Any, via: Tuple[int, ...], depth: int = 0) -> List[Tuple[str, Any, Tuple[int, ...]]]:
-        """(lower-cased key, value node, aliases) of a mapping; `<<` merge keys expanded, explicit keys win."""
+    def _entries(self, node: Any, via: Tuple[int, ...], depth: int = 0, *, preserve_case: bool = False
+                 ) -> List[Tuple[str, Any, Tuple[int, ...]]]:
+        """Mapping keys, values and aliases, with `<<` expanded and explicit keys taking precedence."""
         node, via = self._deref(node, via)
         if depth > self.MAX_DEPTH:
             raise _Bail("nesting")
@@ -892,9 +892,9 @@ class _YamlScan:
             if k.tag == self.MERGE_TAG:
                 vn, vvia = self._deref(v, via)
                 for src in (vn.value if isinstance(vn, self.y.SequenceNode) else [vn]):
-                    merged.extend(self._entries(src, vvia, depth + 1))
+                    merged.extend(self._entries(src, vvia, depth + 1, preserve_case=preserve_case))
             else:
-                explicit.append((k.value.lower(), v, via))
+                explicit.append((k.value if preserve_case else k.value.lower(), v, via))
         names = {e[0] for e in explicit}
         for e in merged:
             if e[0] not in names:
@@ -941,7 +941,7 @@ class _YamlScan:
         scope: Dict[str, List[int]] = {}
         chain = [scope, *parent]
         for node, via in env:
-            for name, v, vv in self._entries(node, via):
+            for name, v, vv in self._entries(node, via, preserve_case=not self.fold_env):
                 scope.setdefault(name, []).append(len(self.binds))
                 self.binds.append(_Bind("env", name, self._texts(v, vv), chain, matrix, after_writer))
         return chain
@@ -980,8 +980,9 @@ class _YamlScan:
     def _step(self, node: Any, via: Tuple[int, ...], job_chain: List[Dict[str, List[int]]],
               matrix: Dict[str, List[int]], writer_seen: bool) -> _Step:
         entries = self._entries(node, via)
+        first_binding = len(self.binds)
         chain = self._env_scope(self._get(entries, "env"), job_chain, matrix, writer_seen)
-        rec = _Step(chain, matrix)
+        rec = _Step(chain, matrix, range(first_binding, len(self.binds)))
         uses = ""
         for un, uv in self._get(entries, "uses"):
             uses = " ".join(" ".join(t.text for t in self._texts(un, uv)).split())
@@ -1000,9 +1001,9 @@ class _YamlScan:
                     known, where = key in codes.get(action, ()), f"input:{action}"
                 if known:
                     rec.sinks.extend((where, t) for t in self._texts(v, vv))
-        script = "\n".join(t.text for t in rec.run_texts).lower()
-        rec.writes_env = "github_env" in script
-        rec.reads_event_file = "github_event_path" in script
+        script = "\n".join(t.text for t in rec.run_texts)
+        rec.writes_env = "github_env" in script.lower() and not self.LITERAL_ENV_WRITE.fullmatch(script.strip())
+        rec.reads_event_file = "github_event_path" in script.lower()
         return rec
 
     def _steps(self, steps: List[Tuple[Any, Tuple[int, ...]]], job_chain: List[Dict[str, List[int]]],
@@ -1023,6 +1024,13 @@ class _YamlScan:
             for jobs_node, jvia in self._get(root, "jobs"):
                 for _, job, jv in self._entries(jobs_node, jvia):
                     entries = self._entries(job, jv)
+                    runners = self._get(entries, "runs-on")
+                    # The runner folds env keys on Windows. Dynamic and custom labels, and composite
+                    # actions with no runner of their own, are checked under both case rules.
+                    runner, _ = self._deref(*runners[0]) if len(runners) == 1 else (None, ())
+                    hosted = self.HOSTED_RUNNER.fullmatch(runner.value) if isinstance(runner, self.y.ScalarNode) else None
+                    if hosted and (hosted[1] == "windows") != self.fold_env:
+                        continue
                     matrix = self._matrix(self._get(entries, "strategy"), wf_chain)
                     chain = self._env_scope(self._get(entries, "env"), wf_chain, matrix, False)
                     self._steps(self._get(entries, "steps"), chain, matrix)
@@ -1048,11 +1056,20 @@ class _YamlScan:
             return [i for key in (name, "*") for i in matrix.get(key, ())]
         return [i for js in matrix.values() for i in js]
 
-    def _solve(self) -> Tuple[List[bool], List[Optional[int]]]:
-        """(tainted per binding, per binding the added line that sets it or what taints it)."""
+    def _binding_ref(self, ctx: str) -> Tuple[str, str]:
+        kind, _, tail = ctx.partition(".")
+        kind = kind.lower()
+        name = tail.partition(".")[0]
+        if kind != "env" or self.fold_env:
+            name = name.lower()
+        return kind, "" if name == "*" else name
+
+    def _solve(self) -> Tuple[List[bool], List[Optional[int]], Dict[int, List[int]], Set[int]]:
+        """Solve static taint and collect bindings that can read the runtime environment."""
         P = UntrustedContextPolicy
         users: Dict[int, List[int]] = {}
         direct: List[int] = []
+        runtime: Set[int] = set()
         for idx, b in enumerate(self.binds):
             hit = False
             for t in b.texts:
@@ -1060,12 +1077,12 @@ class _YamlScan:
                     if P.is_boolean(inner):
                         continue
                     for ctx in P.contexts(inner):
-                        seg = ctx.lower().split(".")
-                        if seg[0] in ("env", "matrix"):
-                            name = seg[1] if len(seg) > 1 and seg[1] != "*" else ""
-                            ids = self._visible(b.chain, b.matrix, seg[0], name, exclude=idx)
-                            if seg[0] == "env" and name and not ids and b.after_writer:
-                                hit = True  # may have been written through $GITHUB_ENV
+                        kind, name = self._binding_ref(ctx)
+                        if kind in ("env", "matrix"):
+                            ids = self._visible(b.chain, b.matrix, kind, name, exclude=idx)
+                            if kind == "env" and b.after_writer and (
+                                    not name or not any(i != idx for i in b.chain[0].get(name, ()))):
+                                runtime.add(idx)
                             for i in ids:
                                 users.setdefault(i, []).append(idx)
                         elif P.classify(ctx) == "unsafe":
@@ -1088,34 +1105,45 @@ class _YamlScan:
                            None)
                 inherited = own if own is not None else inherited
                 prod[k], done[k] = inherited, True
-        return tainted, prod
+        return tainted, prod, users, runtime
+
+    def _apply_runtime(self, step: _Step, line: Optional[int], runtime: Set[int],
+                       users: Dict[int, List[int]], tainted: List[bool], prod: List[Optional[int]]) -> None:
+        queue = deque((i, line) for i in step.bindings if i in runtime)
+        while queue:
+            i, inherited = queue.popleft()
+            own = next((ln for t in self.binds[i].texts if (ln := t.any_line(self.added)) is not None), None)
+            producer = own if own is not None else inherited
+            if tainted[i] and (prod[i] is not None or producer is None):
+                continue
+            tainted[i], prod[i] = True, producer
+            queue.extend((user, producer) for user in users.get(i, ()))
 
     # ---- evaluation
 
-    def _hit(self, kind: str, name: str, step: _Step, gh: _GhEnv, tainted: List[bool], prod: List[Optional[int]]
+    def _hit(self, kind: str, name: str, step: _Step, runtime_tainted: bool, runtime_line: Optional[int],
+             tainted: List[bool], prod: List[Optional[int]]
              ) -> Tuple[bool, Optional[int], str]:
-        if kind == "env" and gh:
-            local = step.chain[0] if step.chain else {}
-            if (name and name not in local and (gh.wild or name in gh.names)) or not name:
-                return True, gh.line, " (set through GITHUB_ENV)"
+        if kind == "env" and runtime_tainted and name not in step.chain[0]:
+            return True, runtime_line, " (set through GITHUB_ENV)"
         bad = [i for i in self._visible(step.chain, step.matrix, kind, name) if tainted[i]]
         return bool(bad), next((prod[i] for i in bad if prod[i] is not None), None), ""
 
-    def _evaluate(self, step: _Step, gh: _GhEnv, tainted: List[bool], prod: List[Optional[int]]) -> bool:
+    def _evaluate(self, step: _Step, runtime_tainted: bool, runtime_line: Optional[int],
+                  tainted: List[bool], prod: List[Optional[int]]) -> bool:
         """Record the findings of one step; True if any of its `run:` text reads attacker text."""
         P = UntrustedContextPolicy
         run_bad = False
         for where, t in step.sinks:
-            for s, _, inner in WorkflowInjectionScanner._expressions(t.text):
+            for start, end, inner in WorkflowInjectionScanner._expressions(t.text):
                 if P.is_boolean(inner):
                     continue
                 bad: List[str] = []
                 producer: Optional[int] = None
                 for ctx in P.contexts(inner):
-                    seg = ctx.lower().split(".")
-                    name = seg[1] if len(seg) > 1 and seg[1] != "*" else ""
-                    if seg[0] in ("env", "matrix"):
-                        hit, pl, note = self._hit(seg[0], name, step, gh, tainted, prod)
+                    kind, name = self._binding_ref(ctx)
+                    if kind in ("env", "matrix"):
+                        hit, pl, note = self._hit(kind, name, step, runtime_tainted, runtime_line, tainted, prod)
                     else:
                         hit, pl, note = P.classify(ctx) == "unsafe", None, ""
                     if hit:
@@ -1124,7 +1152,7 @@ class _YamlScan:
                 if not bad:
                     continue
                 run_bad = run_bad or where == "run"
-                line = t.line(s, self.added)
+                line = t.line(start, end, self.added)
                 if line is None:
                     line = producer
                 if line is not None:
@@ -1132,26 +1160,33 @@ class _YamlScan:
                     found.extend(c for c in bad if c not in found)
         return run_bad
 
-    def run(self) -> List[Tuple[int, List[str], str]]:
-        self._collect(self._compose())
-        tainted, prod = self._solve()
+    def run(self, docs: List[Any]) -> List[Tuple[int, List[str], str]]:
+        self._collect(docs)
+        tainted, prod, users, runtime = self._solve()
         for recs in self.jobs:
-            gh = _GhEnv()
+            runtime_tainted = False
+            runtime_line = None
             for step in recs:
-                run_bad = self._evaluate(step, gh, tainted, prod)
+                if runtime_tainted:
+                    self._apply_runtime(step, runtime_line, runtime, users, tainted, prod)
+                run_bad = self._evaluate(step, runtime_tainted, runtime_line, tainted, prod)
                 if not step.writes_env:
                     continue
-                visible = any(tainted[i] for scope in step.chain for js in scope.values() for i in js) or \
-                    any(tainted[i] for js in step.matrix.values() for i in js)
-                if run_bad or visible or step.reads_event_file or gh:  # it may write attacker text
-                    script = "\n".join(t.text for t in step.run_texts)
-                    names = {n.lower() for n in self.GH_ENV_NAME_RE.findall(script)}
-                    gh.names |= names
-                    gh.wild = gh.wild or not names
-                    if gh.line is None:
-                        gh.line = next((ln for t in step.run_texts for ln in [t.any_line(self.added)]
-                                        if ln is not None), None)
-        return [(line, bad, where) for line, (bad, where) in sorted(self.hits.items())]
+                visible = [i for scope in [*step.chain, step.matrix] for ids in scope.values()
+                           for i in ids if tainted[i]]
+                if run_bad or visible or step.reads_event_file or runtime_tainted:
+                    # Attacker text can contain newlines and introduce records for arbitrary names.
+                    runtime_tainted = True
+                    if runtime_line is None:
+                        runtime_line = next((ln for t in step.run_texts if (ln := t.any_line(self.added)) is not None),
+                                            None)
+                    if runtime_line is None:
+                        runtime_line = next((prod[i] for i in visible if prod[i] is not None), None)
+        by_git_line: Dict[int, Tuple[List[str], str]] = {}
+        for line, (bad, where) in sorted(self.hits.items()):
+            found = by_git_line.setdefault(self.git_lines[line - 1], ([], where))[0]
+            found.extend(c for c in bad if c not in found)
+        return [(line, bad, where) for line, (bad, where) in by_git_line.items()]
 
 
 def _yaml_hits(text: str, added: Set[int]) -> Optional[List[Tuple[int, List[str], str]]]:
@@ -1161,7 +1196,15 @@ def _yaml_hits(text: str, added: Set[int]) -> Optional[List[Tuple[int, List[str]
     if yaml is None:
         return None
     try:
-        return _YamlScan(yaml, text, added).run()
+        exact = _YamlScan(yaml, text, added)
+        docs = exact._compose()
+        folded = _YamlScan(yaml, text, added, fold_env=True)
+        hits: Dict[int, Tuple[List[str], str]] = {}
+        for scan in (exact, folded):
+            for line, bad, where in scan.run(docs):
+                found = hits.setdefault(line, ([], where))[0]
+                found.extend(ctx for ctx in bad if ctx not in found)
+        return [(line, bad, where) for line, (bad, where) in sorted(hits.items())]
     except Exception:  # noqa: BLE001 - YAMLError, _Bail, RecursionError, ...: none of them may pass silently
         return None
 
@@ -1385,8 +1428,7 @@ class WorkflowInjectionScanner:
             if all(0 < n <= len(lines) and lines[n - 1].rstrip() == text.translate(LINE_BREAKS).rstrip()
                    for hunk in hunks for n, text, _ in hunk):
                 added = {n for hunk in hunks for n, _, is_add in hunk if is_add}
-                parse_text = post_image.replace("\r\n", "\n").translate(LINE_BREAKS)
-                return [([(n, text, n in added) for n, text in enumerate(lines, 1)], False)], True, parse_text
+                return [([(n, text, n in added) for n, text in enumerate(lines, 1)], False)], True, post_image
         headers = [m for m in (HUNK_HEADER_RE.match(ln) for ln in patch_text.split("\n")) if m]
         new_file = len(headers) == 1 and headers[0].group(1) == "0" and headers[0].group(2) == "0"
         return [(hunk, hunk[0][0] > 1) for hunk in hunks], new_file, None
