@@ -473,7 +473,7 @@ def test_ruleset_requires_the_check_that_actually_runs():
 
 def test_new_workflow_files_pass_actionlint_and_zizmor():
     files = sorted(str(p) for p in (ROOT / ".github" / "workflows").glob("*.yml"))
-    assert len(files) == 3
+    assert len(files) == 7
     r = subprocess.run([_tool("actionlint"), "-no-color", *files], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
