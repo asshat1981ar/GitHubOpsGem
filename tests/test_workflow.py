@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REUSABLE = ROOT / "ci" / "gem-review.yml"
 CALLER = ROOT / "ci" / "gem-review-caller.example.yml"
 HELPER = ROOT / "ci" / "gem_review_steps.py"
+REQUIREMENTS = ROOT / "ci" / "requirements-gem-review.txt"
 GEMCTL = ROOT / "gemctl.py"
 WORKFLOWS = [REUSABLE, CALLER]
 # Where each file is installed, so gemctl applies its workflow rules (it decides by path).
@@ -260,7 +261,10 @@ def simulate(tmp_path, repo, head, base, **inputs):
     ws, temp, art, shim = (tmp_path / d for d in ("workspace", "runner_temp", "artifact", "bin"))
     for d in (ws, temp, shim):
         d.mkdir()
-    (shim / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    # `python -I -m pip ...` is recorded, not run: the simulation must not install into the test interpreter.
+    (shim / "python").write_text(
+        '#!/bin/sh\ncase " $* " in *" -m pip "*) printf \'%s\\n\' "$*" >> "$PIP_LOG"; exit 0;; esac\n'
+        f'exec "{sys.executable}" "$@"\n')
     (shim / "python").chmod(0o755)
     summary = temp / "step_summary.md"
     summary.touch()
@@ -269,7 +273,8 @@ def simulate(tmp_path, repo, head, base, **inputs):
                       "event": {"pull_request": {"number": 7, "head": {"sha": head}, "base": {"sha": base}}}}}
     base_env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "GEM_", "RUNNER_"))}
     base_env.update(PATH=f"{shim}{os.pathsep}{os.environ['PATH']}", RUNNER_TEMP=str(temp), GITHUB_WORKSPACE=str(ws),
-                    GITHUB_STEP_SUMMARY=str(summary), HOME=str(tmp_path), GIT_CONFIG_NOSYSTEM="1")
+                    GITHUB_STEP_SUMMARY=str(summary), HOME=str(tmp_path), GIT_CONFIG_NOSYSTEM="1",
+                    PIP_LOG=str(tmp_path / "pip.log"))
     (job,) = doc["jobs"].values()
     results, failed = [], False
     for step in job["steps"]:
@@ -284,7 +289,8 @@ def simulate(tmp_path, repo, head, base, **inputs):
                 subprocess.run(["git", "-C", str(ws / "target"), "checkout", "-q", "--detach", w["ref"]], check=True)
             elif action == "actions/checkout":
                 assert w["path"] == "gem" and w["ref"] == ins["gem_ref"] and w["repository"] == ins["gem_repository"]
-                for f in ("gemctl.py", "mcp_reference_monitor.py", "ci/gem_review_steps.py"):
+                for f in ("gemctl.py", "mcp_reference_monitor.py", "ci/gem_review_steps.py",
+                          "ci/requirements-gem-review.txt"):
                     (ws / "gem" / f).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy(ROOT / f, ws / "gem" / f)
             elif action == "actions/upload-artifact" and Path(w["path"]).is_dir():
@@ -299,7 +305,9 @@ def simulate(tmp_path, repo, head, base, **inputs):
         results.append((name, r.returncode, r.stdout + r.stderr))
         failed = failed or r.returncode != 0
     res_file = art / "gem-review.json"
+    pip_log = tmp_path / "pip.log"
     return {"steps": results, "failed": failed, "summary": summary.read_text(encoding="utf-8"),
+            "pip": pip_log.read_text().splitlines() if pip_log.is_file() else [], "gem": ws / "gem",
             "results": json.loads(res_file.read_text()) if res_file.is_file() else None,
             "log": "".join(out for _, _, out in results)}
 
@@ -433,7 +441,8 @@ def test_installed_reusable_workflow_is_the_tested_source():
 
 def test_self_caller_is_hardened_and_reviews_with_the_base_commit():
     w = load(SELF_CALLER)
-    assert set(w[True]) == {"pull_request"} and "pull_request_target" not in SELF_CALLER.read_text()
+    assert set(w[True]) == {"pull_request"} and w[True]["pull_request"] is None   # every PR
+    assert "pull_request_target" not in SELF_CALLER.read_text()
     assert w["permissions"] == {"contents": "read", "pull-requests": "read"}
     (name, job), = jobs(w)
     assert job["uses"] == "./.github/workflows/gem-review.yml"   # same commit as the caller (see file comment)
@@ -450,7 +459,9 @@ def test_ruleset_requires_the_check_that_actually_runs():
     expected = f"{caller_job} / {callee_job}"
     main = json.loads((ROOT / "ci" / "rulesets" / "main.json").read_text())
     checks = [r for r in main["rules"] if r["type"] == "required_status_checks"][0]["parameters"]["required_status_checks"]
-    assert checks == [{"context": expected, "integration_id": 15368}]          # 15368 = GitHub Actions
+    assert checks[0] == {"context": expected, "integration_id": 15368}          # 15368 = GitHub Actions
+    tests_job = load(ROOT / ".github" / "workflows" / "tests.yml")["jobs"]["pytest"]["name"]
+    assert checks[1:] == [{"context": tests_job, "integration_id": 15368}]
     types = {r["type"] for r in main["rules"]}
     assert {"deletion", "non_fast_forward", "pull_request", "required_status_checks"} <= types
     assert all(b["bypass_mode"] == "pull_request" for b in main["bypass_actors"])  # no direct-push bypass
@@ -461,9 +472,125 @@ def test_ruleset_requires_the_check_that_actually_runs():
 
 
 def test_new_workflow_files_pass_actionlint_and_zizmor():
-    files = [str(INSTALLED), str(SELF_CALLER)]
+    files = sorted(str(p) for p in (ROOT / ".github" / "workflows").glob("*.yml"))
+    assert len(files) == 3
     r = subprocess.run([_tool("actionlint"), "-no-color", *files], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     r = subprocess.run([_tool("zizmor"), "--offline", "--min-severity", "low", *files], capture_output=True,
                        text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_tests_workflow_is_hardened():
+    w = load(ROOT / ".github" / "workflows" / "tests.yml")
+    assert w["permissions"] == {"contents": "read"} and "pull_request_target" not in str(w[True])
+    job = w["jobs"]["pytest"]
+    assert job["permissions"] == {"contents": "read"} and 0 < job["timeout-minutes"] <= 30
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", step["uses"]), step["uses"]
+        if "run" in step:
+            assert "${{" not in step["run"]
+            if "pip install" in step["run"]:
+                args = step["run"].split("install", 1)[1].split()
+                pkgs = [a for a in args if not a.startswith("-")]
+                assert pkgs and all(re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][0-9A-Za-z.]*", p) for p in pkgs), pkgs
+    checkouts = [s for s in job["steps"] if "actions/checkout" in s.get("uses", "")]
+    assert checkouts and all(s.get("with", {}).get("persist-credentials") is False for s in checkouts)
+    assert set(w[True]) == {"pull_request", "push"} and w[True]["pull_request"] is None   # every PR
+
+
+def test_sim_scan_uses_pr_head_checkout_for_env_context(tmp_path, repo):
+    """gem-review gives scan-diff the PR-head checkout, so an env binding outside the hunk is seen.
+
+    Patch-only scans fail closed on `${{ env.X }}` with no visible binding (CodeRabbit 4506305087); in CI the
+    changed file is on disk in `target/`, so a safely bound X must not become a CRITICAL there.
+    """
+    filler = "".join(f"      - run: echo step{i}\n" for i in range(12))
+    base_wf = ("on: pull_request\nenv:\n  GREETING: hello\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n"
+               + filler)
+    repo.commit({".github/workflows/env.yml": base_wf}, "env workflow")
+    base = repo.git("rev-parse", "main")
+    repo.branch("pr")
+    head = repo.commit({".github/workflows/env.yml": base_wf + "      - run: echo \"${{ env.GREETING }}\"\n"},
+                       "use env")
+    sim = simulate(tmp_path, repo, head, base)
+    assert _exit_of(sim, "Scan each changed file (gemctl scan-diff)") == 0, sim["log"]
+    assert "CWE-94_WORKFLOW_INJECTION" not in _categories(sim), sim["results"]
+    assert not sim["failed"], sim["log"]
+
+
+def test_sim_scan_with_pr_head_checkout_still_flags_tainted_env(tmp_path, repo):
+    """Full-file context must keep an untrusted binding outside the hunk tainted."""
+    filler = "".join(f"      - run: echo step{i}\n" for i in range(12))
+    base_wf = ("on: issues\nenv:\n  TITLE: ${{ github.event.issue.title }}\njobs:\n  b:\n    runs-on: ubuntu-latest\n"
+               "    steps:\n" + filler)
+    repo.commit({".github/workflows/env.yml": base_wf}, "env workflow")
+    base = repo.git("rev-parse", "main")
+    repo.branch("pr")
+    head = repo.commit({".github/workflows/env.yml": base_wf + "      - run: echo \"${{ env.TITLE }}\"\n"}, "use env")
+    sim = simulate(tmp_path, repo, head, base)
+    assert "CWE-94_WORKFLOW_INJECTION" in _categories(sim), sim["log"]
+
+
+# ---------------------------------------------------------------- PyYAML: the scanner's one dependency
+
+def test_requirements_pin_one_exact_version_with_sha256_hashes():
+    text = "".join(ln for ln in REQUIREMENTS.read_text().splitlines(True) if not ln.lstrip().startswith("#"))
+    entries = [e.strip() for e in text.replace("\\\n", " ").splitlines() if e.strip()]
+    assert len(entries) == 1
+    name, *opts = entries[0].split()
+    assert re.fullmatch(r"PyYAML==\d+\.\d+\.\d+", name)
+    assert opts and all(re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", o) for o in opts)
+    assert name == f"PyYAML=={yaml.__version__}", "the tests should run against the pinned PyYAML"
+
+
+def test_workflow_installs_the_dependency_hash_checked_from_the_gem_checkout_before_scanning():
+    names = [s["name"] for s in steps(load(REUSABLE))]
+    (install,) = [s for s in steps(load(REUSABLE)) if "pip" in s.get("run", "")]
+    assert names.index("Set up Python") < names.index(install["name"]) < names.index(
+        "Scan each changed file (gemctl scan-diff)")
+    cmd = " ".join(install["run"].replace("\\\n", " ").split())
+    for flag in ("--require-hashes", "--only-binary=:all:", "--no-deps", "-r gem/ci/requirements-gem-review.txt"):
+        assert flag in cmd, flag
+    assert "target/" not in cmd and "${{" not in cmd and "env" not in install     # nothing from the PR
+
+
+def test_sim_runs_the_pinned_install_from_the_gem_checkout(tmp_path, repo):
+    base = repo.git("rev-parse", "main")
+    repo.branch("pr")
+    head = repo.commit({"app/main.py": "print('hello')\n"}, "clean")
+    sim = simulate(tmp_path, repo, head, base)
+    assert not sim["failed"], sim["log"]
+    assert len(sim["pip"]) == 1 and "--require-hashes" in sim["pip"][0]
+    assert (sim["gem"] / "ci" / "requirements-gem-review.txt").read_bytes() == REQUIREMENTS.read_bytes()
+
+
+def test_workflow_install_allows_a_trusted_checkout_without_a_manifest(tmp_path):
+    (tmp_path / "gem").mkdir()
+    (install,) = [s for s in steps(load(REUSABLE)) if "pip" in s.get("run", "")]
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", install["run"]], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_scan_step_fails_closed_without_pyyaml(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gem_review_steps_under_test", HELPER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    work = tmp_path / "work"
+    (work / "results").mkdir(parents=True)
+    (work / "results" / "diff.json").write_text(json.dumps({"files": [], "repo": str(tmp_path)}))
+    assert mod.main(["scan", "--gem", str(ROOT), "--work", str(work)]) == 0
+    real = mod.subprocess.run
+
+    def no_yaml(cmd, *a, **kw):
+        if "-c" in cmd and "yaml" in cmd[-1]:
+            return subprocess.CompletedProcess(cmd, 1, "", "ModuleNotFoundError: No module named 'yaml'")
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", no_yaml)
+    (work / "results" / "scan.json").unlink()
+    assert mod.main(["scan", "--gem", str(ROOT), "--work", str(work)]) == 1     # exit 1: the check fails closed
+    assert not (work / "results" / "scan.json").exists()

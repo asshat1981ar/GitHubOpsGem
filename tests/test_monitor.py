@@ -495,3 +495,423 @@ def test_scan_diff_catches_token_behind_line_separator(tmp_path):
 def test_crlf_patches_still_parse():
     patch = "--- a/x.py\r\n+++ b/x.py\r\n@@ -1,1 +1,2 @@\r\n ctx\r\n+new\r\n"
     assert [(l.kind, l.content) for l in m.iter_patch_lines(patch)] == [("ctx", "ctx"), ("add", "new")]
+
+
+# ---------------------------------------------------------------- CWE-94: execution sinks and untrusted contexts only
+# Expression injection happens only where GitHub pastes `${{ }}` text into code that then runs (`run:`,
+# actions/github-script `script:`) and only for attacker-controllable contexts. These go through the same entry
+# point as `gemctl scan-diff` (audit_diff) and assert the exact category and severity of every finding.
+
+GH_SCRIPT = "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1"
+CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
+WF_HEAD = "on: [pull_request, workflow_dispatch]\npermissions: {}\njobs:\n  test:\n    runs-on: ubuntu-24.04\n    steps:\n"
+CWE94 = (m.Severity.CRITICAL, "CWE-94_WORKFLOW_INJECTION")
+
+
+def _new_file_patch(text):
+    lines = text.splitlines()
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{ln}\n" for ln in lines)
+
+
+def _scan(path, text, post_image=None):
+    return [(f.line, f.severity, f.category)
+            for f in m.SupplyChainAndSecretScanner.audit_diff(path, _new_file_patch(text), post_image=post_image)]
+
+
+def _expr_line(text):
+    hits = [i for i, ln in enumerate(text.splitlines(), 1) if "${{" in ln]
+    assert len(hits) == 1, hits
+    return hits[0]
+
+
+CWE94_MUST_FLAG = {
+    "run-pr-title": (WF, WF_HEAD + '      - run: echo "${{ github.event.pull_request.title }}"\n'),
+    "run-block-head-ref": (WF, WF_HEAD + "      - name: Push\n        run: |\n          git fetch origin\n"
+                                         '          git push origin "HEAD:${{ github.head_ref }}"\n          echo done\n'),
+    "github-script-comment-body": (WF, WF_HEAD + f"      - uses: {GH_SCRIPT}\n        with:\n          script: |\n"
+                                                 "            const body = `${{ github.event.comment.body }}`\n"
+                                                 "            core.info(body)\n"),
+    "run-inputs": (WF, WF_HEAD + "      - run: ${{ inputs.cmd }}\n"),
+    "run-step-output": (WF, WF_HEAD + "      - id: x\n        run: echo ok\n      - run: echo ${{ steps.x.outputs.y }}\n"),
+    "run-or-with-unsafe-operand": (WF, WF_HEAD + "      - run: echo ${{ github.event.pull_request.number"
+                                                 " || github.event.pull_request.title }}\n"),
+    "composite-action-issue-body": ("action.yml", "name: greet\ndescription: x\nruns:\n  using: composite\n  steps:\n"
+                                                  '    - shell: bash\n      run: echo "${{ github.event.issue.body }}"\n'),
+    "nested-composite-action": (".github/actions/greet/action.yml",
+                                "runs:\n  using: composite\n  steps:\n    - shell: bash\n"
+                                "      run: |\n        echo '${{ github.event.issue.body }}'\n"),
+    "folded-block": (WF, WF_HEAD + "      - run: >-\n          echo\n          ${{ github.event.issue.title }}\n"),
+    "quoted-run-key": (WF, WF_HEAD + "      - \"run\": echo ${{ github.event.review.body }}\n"),
+    "next-line-plain-scalar": (WF, WF_HEAD + "      - run:\n          echo ${{ github.event.head_commit.message }}\n"),
+    "shell-comment-inside-run": (WF, WF_HEAD + "      - run: |\n          # ${{ github.event.issue.title }}\n          true\n"),
+    "tojson-whole-pr": (WF, WF_HEAD + "      - run: echo '${{ toJSON(github.event.pull_request) }}'\n"),
+    "bracket-and-index": (WF, WF_HEAD + "      - run: echo ${{ github.event['commits'][0].message }}\n"),
+    "env-context-of-untrusted-env": (WF, WF_HEAD + "      - env:\n          TITLE: ${{ github.event.issue.title }}\n"
+                                                   "        run: echo ${{ env.TITLE }}\n"),
+    "flow-mapping-step": (WF, WF_HEAD + '      - {name: x, run: "echo ${{ github.head_ref }}"}\n'),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CWE94_MUST_FLAG))
+def test_cwe94_flags_untrusted_context_in_execution_sink(case):
+    path, text = CWE94_MUST_FLAG[case]
+    line = (len(text.splitlines()) if case == "env-context-of-untrusted-env" else _expr_line(text))
+    assert _scan(path, text) == [(line, *CWE94)]
+
+
+CWE94_MUST_NOT_FLAG = {
+    "concurrency-group": "on: pull_request\nconcurrency:\n"
+                         "  group: tests-${{ github.event.pull_request.number || github.ref }}\n"
+                         "  cancel-in-progress: true\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: make\n",
+    "env-binding": WF_HEAD + "      - env:\n          TITLE: ${{ github.event.pull_request.title }}\n"
+                             '        run: echo "$TITLE"\n',
+    "if-condition": WF_HEAD + "      - if: github.event.pull_request.head.ref == 'x'\n        run: echo hi\n"
+                              "      - if: ${{ github.event.pull_request.head.ref == 'x' }}\n        run: echo hi\n",
+    "checkout-with-head-sha": WF_HEAD + f"      - uses: {CHECKOUT}\n        with:\n"
+                                        "          ref: ${{ github.event.pull_request.head.sha }}\n"
+                                        "          persist-credentials: false\n",
+    "run-pr-number": WF_HEAD + "      - run: echo ${{ github.event.pull_request.number }}\n",
+    "run-sha": WF_HEAD + "      - run: git checkout ${{ github.sha }}\n",
+    "step-name": WF_HEAD + "      - name: Build ${{ github.event.pull_request.title }}\n        run: make\n",
+    "yaml-comments": WF_HEAD + '      # - run: echo "${{ github.event.issue.title }}"\n'
+                               "      - run: make # ${{ github.head_ref }}\n",
+    "refs-are-safe-by-choice": WF_HEAD + "      - run: echo ${{ github.ref }} ${{ github.ref_name }} ${{ github.base_ref }}\n",
+    "other-actions-script-input": WF_HEAD + f"      - uses: {CHECKOUT.replace('actions/checkout', 'acme/runner')}\n"
+                                            "        with:\n          script: ${{ github.event.issue.title }}\n",
+    "reusable-workflow-with": "on: pull_request\njobs:\n  call:\n"
+                              f"    uses: org/repo/.github/workflows/x.yml@{'a' * 40}\n"
+                              "    with:\n      script: ${{ github.event.pull_request.title }}\n",
+    "job-outputs-and-runs-on": "on: pull_request\njobs:\n  t:\n    runs-on: ${{ inputs.runner }}\n"
+                               "    timeout-minutes: ${{ inputs.minutes }}\n"
+                               "    outputs:\n      title: ${{ steps.x.outputs.title }}\n    steps:\n      - run: make\n",
+    "defaults-run": "on: pull_request\ndefaults:\n  run:\n    working-directory: ${{ github.head_ref }}\n"
+                    "jobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: make\n",
+    "safe-contexts-in-run": WF_HEAD + "      - run: |\n          echo ${{ runner.temp }} ${{ matrix.os }} ${{ github.run_id }}\n"
+                                      "          echo ${{ needs.build.result }} ${{ github.event.issue.number }}\n",
+}
+
+
+@pytest.mark.parametrize("case", sorted(CWE94_MUST_NOT_FLAG))
+def test_cwe94_ignores_data_positions_and_safe_contexts(case):
+    assert _scan(WF, CWE94_MUST_NOT_FLAG[case]) == []
+
+
+def test_cwe94_github_script_needs_the_github_script_action():
+    step = "      - with:\n          script: core.info('${{ github.event.issue.title }}')\n        uses: USES\n"
+    assert _scan(WF, WF_HEAD + step.replace("USES", GH_SCRIPT)) == [(len(WF_HEAD.splitlines()) + 2, *CWE94)]
+    assert _scan(WF, WF_HEAD + step.replace("USES", "acme/run-js@" + "b" * 40)) == []
+
+
+def test_cwe94_non_workflow_files_are_not_checked():
+    assert _scan("docs/example.yml", WF_HEAD + "      - run: echo ${{ github.head_ref }}\n") == []
+
+
+def test_cwe94_policy_lists_are_consistent():
+    p = m.UntrustedContextPolicy
+    assert all(p.classify(c.replace("*", "x")) == "unsafe" for c in p.DENY)
+    assert all(p.classify(c.replace("*", "x")) == "safe" for c in p.ALLOW)
+    assert p.classify("github.event.pull_request") == "unsafe"   # an object holding title/body
+    assert p.classify("github.event.issue.labels") == "unlisted"
+
+
+RUN_BLOCK_WF = WF_HEAD + ("      - uses: acme/open-issue@" + "c" * 40 + "\n        with:\n          body: |\n"
+                          "            one\n            two\n            three\n"
+                          "            From ${{ github.event.issue.title }}\n            five\n"
+                          "      - run: |\n          echo 1\n          echo 2\n          echo 3\n"
+                          "          echo ${{ github.event.issue.title }}\n          echo 5\n")
+
+
+def _hunk_around(text, line):
+    lines = text.splitlines()
+    lo, hi = line - 3, min(len(lines), line + 3)
+    body = "".join(("+" if n == line else " ") + lines[n - 1] + "\n" for n in range(lo, hi + 1))
+    return f"@@ -{lo},{hi - lo} +{lo},{hi - lo + 1} @@\n" + body
+
+
+def test_cwe94_hunk_without_its_key_fails_closed_and_post_image_resolves_it():
+    lines = RUN_BLOCK_WF.splitlines()
+    in_body, in_run = [i for i, ln in enumerate(lines, 1) if "${{" in ln]
+    for line in (in_body, in_run):  # the enclosing key is 4 lines up, outside the 3-line context
+        found = m.SupplyChainAndSecretScanner.audit_diff(WF, _hunk_around(RUN_BLOCK_WF, line))
+        assert [(f.line, f.severity, f.category) for f in found] == [(line, *CWE94)]
+    full = lambda line, img: [(f.line, f.severity, f.category) for f in  # noqa: E731
+                              m.SupplyChainAndSecretScanner.audit_diff(WF, _hunk_around(RUN_BLOCK_WF, line), post_image=img)]
+    assert full(in_body, RUN_BLOCK_WF) == []                     # `with: body:` of another action: data
+    assert full(in_run, RUN_BLOCK_WF) == [(in_run, *CWE94)]
+    stale = RUN_BLOCK_WF.replace("            two\n", "            2\n")  # does not match the patch: ignored
+    assert full(in_body, stale) == [(in_body, *CWE94)]
+
+
+def _gemctl_scan(tmp_path, cwd, path, patch_text, *extra):
+    import subprocess
+    patch = tmp_path / "change.diff"
+    patch.write_text(patch_text, encoding="utf-8")
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    r = subprocess.run([sys.executable, os.path.join(root, "gemctl.py"), "scan-diff", "--path", path,
+                        "--patch", str(patch), *extra], cwd=str(cwd), capture_output=True, text=True, timeout=60)
+    out = json.loads(r.stdout)
+    return r.returncode, [(f["line"], f["severity"], f["category"]) for f in out["findings"]], out["critical"]
+
+
+def test_gemctl_scan_diff_e2e_flags_sinks_and_fails_on_critical(tmp_path):
+    text = CWE94_MUST_FLAG["run-block-head-ref"][1]
+    rc, found, critical = _gemctl_scan(tmp_path, tmp_path, WF, _new_file_patch(text), "--fail-on-critical")
+    assert (rc, found, critical) == (2, [(_expr_line(text), "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+    text = CWE94_MUST_FLAG["composite-action-issue-body"][1]
+    rc, found, critical = _gemctl_scan(tmp_path, tmp_path, "action.yml", _new_file_patch(text), "--fail-on-critical")
+    assert (rc, found, critical) == (2, [(_expr_line(text), "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+
+
+def test_gemctl_scan_diff_e2e_passes_the_first_pr_concurrency_group(tmp_path):
+    for case in ("concurrency-group", "env-binding", "step-name", "checkout-with-head-sha"):
+        rc, found, critical = _gemctl_scan(tmp_path, tmp_path, WF, _new_file_patch(CWE94_MUST_NOT_FLAG[case]),
+                                           "--fail-on-critical")
+        assert (rc, found, critical) == (0, [], 0), case
+
+
+def _with_index(patch, post_image):
+    """A git-style header naming the post-image's blob, as `git diff` writes it."""
+    import hashlib
+    data = post_image.encode("utf-8")
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    return f"diff --git a/{WF} b/{WF}\nindex 1234567..{blob[:12]} 100644\n--- a/{WF}\n+++ b/{WF}\n" + patch
+
+
+def test_gemctl_scan_diff_e2e_reads_the_file_at_path_for_context(tmp_path):
+    wf = tmp_path / ".github" / "workflows" / "ci.yml"
+    wf.parent.mkdir(parents=True)
+    wf.write_text(RUN_BLOCK_WF, encoding="utf-8")
+    in_body, in_run = [i for i, ln in enumerate(RUN_BLOCK_WF.splitlines(), 1) if "${{" in ln]
+    body_patch = _with_index(_hunk_around(RUN_BLOCK_WF, in_body), RUN_BLOCK_WF)
+    assert _gemctl_scan(tmp_path, tmp_path, WF, body_patch) == (0, [], 0)
+    assert _gemctl_scan(tmp_path, tmp_path, WF, _with_index(_hunk_around(RUN_BLOCK_WF, in_run), RUN_BLOCK_WF)) == (
+        0, [(in_run, "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+    # No index line: nothing ties the file on disk to the patch, so it is not used (patch-only, fails closed).
+    assert _gemctl_scan(tmp_path, tmp_path, WF, _hunk_around(RUN_BLOCK_WF, in_body)) == (
+        0, [(in_body, "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()  # no file at --path: patch-only, fails closed
+    assert _gemctl_scan(tmp_path, elsewhere, WF, body_patch) == (
+        0, [(in_body, "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+
+
+# ---------------------------------------------------------------- CWE-94: CodeRabbit review of PR #2
+# Each test names the review comment it covers.
+
+def _found(path, patch, post_image=None):
+    return [(f.line, f.severity, f.category)
+            for f in m.SupplyChainAndSecretScanner.audit_diff(path, patch, post_image=post_image)]
+
+
+def _line_of(text, needle):
+    hits = [i for i, ln in enumerate(text.splitlines(), 1) if needle in ln]
+    assert len(hits) == 1, (needle, hits)
+    return hits[0]
+
+
+ENV_FAR_WF = WF_HEAD.replace("    steps:\n", "    env:\n      TITLE: ${{ github.event.issue.title }}\n"
+                             "      SAFE: fixed\n    steps:\n") + \
+    "      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: echo four\n" \
+    '      - run: echo "${{ env.TITLE }}"\n      - run: echo five\n'
+
+
+def test_cwe94_env_binding_outside_patch_fails_closed_4506305087():
+    line = _line_of(ENV_FAR_WF, "env.TITLE")
+    assert _found(WF, _hunk_around(ENV_FAR_WF, line)) == [(line, *CWE94)]          # binding not in view
+    assert _found(WF, _hunk_around(ENV_FAR_WF, line), post_image=ENV_FAR_WF) == [(line, *CWE94)]
+    safe = ENV_FAR_WF.replace("${{ env.TITLE }}", "${{ env.SAFE }}")
+    assert _found(WF, _hunk_around(safe, line), post_image=safe) == []            # binding in view: fixed
+    assert _found(WF, _hunk_around(safe, line)) == [(line, *CWE94)]               # not in view: fail closed
+
+
+def _git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+GH_SCRIPT_FAR_USES = WF_HEAD + (f"      - uses: {GH_SCRIPT}\n        with:\n          script: |\n"
+                                "            const a = 1\n            const b = 2\n            const c = 3\n"
+                                "            const d = 4\n            core.info('ok')\n            const e = 5\n")
+
+
+def test_gemctl_post_image_must_be_the_patch_target_revision_4506305099(tmp_path):
+    repo = tmp_path / "repo"
+    wf = repo / ".github" / "workflows" / "ci.yml"
+    wf.parent.mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    wf.write_text(GH_SCRIPT_FAR_USES, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    staged = GH_SCRIPT_FAR_USES.replace("core.info('ok')", "core.info('${{ github.event.issue.title }}')")
+    wf.write_text(staged, encoding="utf-8")
+    _git(repo, "add", "-A")
+    line = _line_of(staged, "github.event.issue.title")
+    # An unstaged edit outside the hunk swaps the action; the staged patch still adds an unsafe github-script line.
+    wf.write_text(staged.replace(GH_SCRIPT, "acme/data@" + "d" * 40), encoding="utf-8")
+    patch = _git(repo, "diff", "--cached")
+    assert _gemctl_scan(tmp_path, repo, WF, patch) == (0, [(line, "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+    # The same file is used when it IS the patch target (the index line's blob id matches).
+    wf.write_text(staged, encoding="utf-8")
+    assert _gemctl_scan(tmp_path, repo, WF, patch) == (0, [(line, "CRITICAL", "CWE-94_WORKFLOW_INJECTION")], 1)
+
+
+def test_cwe94_env_chain_taint_is_linear_4506305143(monkeypatch):
+    n = 3000
+    env = "".join(f"      E{i}: ${{{{ env.E{i - 1} }}}}\n" for i in range(1, n))
+    text = WF_HEAD.replace("    steps:\n", "    env:\n      E0: ${{ github.event.issue.title }}\n" + env + "    steps:\n") \
+        + f"      - run: echo ${{{{ env.E{n - 1} }}}}\n"
+    calls = {"n": 0}
+    real = m.UntrustedContextPolicy.contexts.__func__
+
+    def counting(cls, expr):
+        calls["n"] += 1
+        if calls["n"] > 10 * n:
+            raise AssertionError("taint propagation is not linear in the number of env bindings")
+        return real(cls, expr)
+
+    monkeypatch.setattr(m.UntrustedContextPolicy, "contexts", classmethod(counting))
+    assert _scan(WF, text) == [(len(text.splitlines()), *CWE94)]
+
+
+def test_cwe94_ambiguous_script_lines_at_hunk_top_fail_closed_4506305108():
+    text = WF_HEAD + (f"      - uses: {GH_SCRIPT}\n        with:\n          script: |\n"
+                      "            const a = 1\n            await github.rest.issues.create({\n"
+                      "              owner: context.repo.owner,\n              repo: context.repo.repo,\n"
+                      "              body: 'x',\n              title: '${{ github.event.issue.title }}',\n"
+                      "              labels: ['bug'],\n            })\n")
+    line = _line_of(text, "github.event.issue.title")
+    assert _found(WF, _hunk_around(text, line)) == [(line, *CWE94)]
+    # A hunk at the top of an env: block is still YAML structure: the binding is data (PR #1).
+    env = WF_HEAD + ("      - name: x\n        env:\n          A: one\n          B: two\n          C: three\n"
+                     "          TITLE: ${{ github.event.issue.title }}\n          D: four\n        run: echo \"$TITLE\"\n")
+    assert _found(WF, _hunk_around(env, _line_of(env, "TITLE:"))) == []
+
+
+ALIAS_WF = WF_HEAD.replace("    steps:\n", "    env:\n      TITLE: &title ${{ github.event.issue.title }}\n"
+                           "      SAFE: &safe fixed\n    steps:\n") + \
+    "      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: *title\n" \
+    "      - run: *safe\n"
+
+
+def test_cwe94_aliases_resolve_to_their_anchor_4506305139():
+    alias_line, safe_line = _line_of(ALIAS_WF, "run: *title"), _line_of(ALIAS_WF, "run: *safe")
+    assert _scan(WF, ALIAS_WF) == [(alias_line, *CWE94)]
+    assert _found(WF, _hunk_around(ALIAS_WF, alias_line)) == [(alias_line, *CWE94)]  # anchor not in view: closed
+    assert _found(WF, _hunk_around(ALIAS_WF, alias_line), post_image=ALIAS_WF) == [(alias_line, *CWE94)]
+    assert _found(WF, _hunk_around(ALIAS_WF, safe_line), post_image=ALIAS_WF) == []      # anchor in view: fixed
+    assert _found(WF, _hunk_around(ALIAS_WF, safe_line)) == [(safe_line, *CWE94)]       # not in view: closed
+
+
+def test_cwe94_expression_folded_across_lines_4506308185():
+    text = WF_HEAD + "      - run: >\n          echo ${{\n          github.event.issue.title\n          }}\n"
+    assert _scan(WF, text) == [(_line_of(text, "echo ${{"), *CWE94)]
+    # Only the middle line is added: the finding lands on the added line inside the expression.
+    lines = text.splitlines()
+    mid = _line_of(text, "github.event.issue.title")
+    patch = f"@@ -1,{len(lines) - 1} +1,{len(lines)} @@\n" + "".join(
+        ("+" if i == mid else " ") + ln + "\n" for i, ln in enumerate(lines, 1))
+    assert _found(WF, patch) == [(mid, *CWE94)]
+
+
+def test_cwe94_dynamic_matrix_carries_untrusted_values_4506305073():
+    dyn = WF_HEAD.replace("    steps:\n", "    strategy:\n      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}\n"
+                          "    steps:\n") + "      - run: echo ${{ matrix.payload }}\n"
+    assert _scan(WF, dyn) == [(len(dyn.splitlines()), *CWE94)]
+    inc = WF_HEAD.replace("    steps:\n", "    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n"
+                          "        include:\n          - payload: ${{ inputs.payload }}\n    steps:\n") + \
+        "      - run: echo ${{ matrix.payload }} ${{ matrix.os }}\n"
+    assert _scan(WF, inc) == [(len(inc.splitlines()), *CWE94)]
+    static = inc.replace("${{ matrix.payload }} ", "")
+    assert _scan(WF, static) == []
+
+
+@pytest.mark.parametrize("expr,flag", [
+    ("contains(github.event.issue.title, 'release')", False),
+    ("github.event.issue.title == 'x'", False),
+    ("!github.event.issue.title", False),
+    ("startsWith(github.head_ref, 'x') || endsWith(github.head_ref, 'y')", False),
+    ("(github.event.issue.title != '')", False),
+    ("contains(github.event.issue.labels.*.name, 'x') && github.event.issue.title", True),
+    ("github.event.issue.title || 'x'", True),
+    ("format('{0}', github.event.issue.title)", True),
+    ("contains(fromJSON('[\"a\"]'), github.head_ref)", False),
+])
+def test_cwe94_boolean_results_are_not_injection_4506305082(expr, flag):
+    text = WF_HEAD + f"      - run: echo ${{{{ {expr} }}}}\n"
+    assert _scan(WF, text) == ([(len(text.splitlines()), *CWE94)] if flag else [])
+
+
+def test_cwe94_expression_extraction_is_quote_aware_4506305090():
+    text = WF_HEAD + "      - run: echo ${{ format('{{\"title\":\"{0}\"}}', github.event.issue.title) }}\n"
+    assert _scan(WF, text) == [(len(text.splitlines()), *CWE94)]
+
+
+def test_cwe94_flow_mapping_env_bindings_4506305109():
+    text = WF_HEAD + "      - env: {TITLE: '${{ github.event.issue.title }}', SAFE: fixed}\n" \
+                     '        run: echo "${{ env.TITLE }}" "${{ env.SAFE }}"\n'
+    assert _scan(WF, text) == [(len(text.splitlines()), *CWE94)]
+
+
+def test_cwe94_uses_value_on_the_next_line_4506305115():
+    text = WF_HEAD + f"      - uses:\n          {GH_SCRIPT}\n        with:\n" \
+                     "          script: core.info('${{ github.event.issue.title }}')\n"
+    assert _scan(WF, text) == [(len(text.splitlines()), *CWE94)]
+
+
+def test_cwe94_block_scalar_trailing_comment_is_not_content_4506305118():
+    text = WF_HEAD + "      - run: |\n            echo hi\n          # ${{ github.head_ref }}\n      - run: make\n"
+    assert _scan(WF, text) == []
+    first = WF_HEAD + "      - run: |\n          # ${{ github.head_ref }}\n            echo hi\n"
+    assert _scan(WF, first) == [(_line_of(first, "head_ref"), *CWE94)]   # first content line: shell comment
+
+
+def test_cwe94_multiline_flow_mappings_4506305124():
+    text = WF_HEAD + '      - {name: x,\n         run: "echo ${{ github.head_ref }}"}\n' \
+        f"      - {{uses: {GH_SCRIPT.split(' ')[0]},\n         with: {{script: \"core.info('${{{{ github.event.issue.title }}}}')\"}}}}\n"
+    assert _scan(WF, text) == [(_line_of(text, "head_ref"), *CWE94), (_line_of(text, "issue.title"), *CWE94)]
+
+
+@pytest.mark.parametrize("uses,inp,flag", [
+    ("appleboy/ssh-action", "script", True),
+    ("azure/cli", "inlineScript", True),
+    ("mikefarah/yq", "cmd", True),
+    ("addnab/docker-run-action", "run", True),
+    ("appleboy/ssh-action", "host", False),
+    ("acme/deploy", "script", False),
+])
+def test_cwe94_code_running_action_inputs_4506305129(uses, inp, flag):
+    text = WF_HEAD + f"      - uses: {uses}@{'e' * 40}\n        with:\n" \
+                     f"          {inp}: echo ${{{{ github.event.issue.title }}}}\n"
+    assert _scan(WF, text) == ([(len(text.splitlines()), *CWE94)] if flag else [])
+
+
+def test_cwe94_double_quoted_escapes_are_decoded_4506305133():
+    text = "runs:\n  using: composite\n  steps:\n    - shell: bash\n" \
+           '      run: "echo \\u0024{{ github.event.issue.title }}"\n' \
+           '    - shell: bash\n      "r\\u0075n": "echo \\x24{{ github.head_ref }}"\n'
+    assert _scan("action.yml", text) == [(5, *CWE94), (7, *CWE94)]
+
+
+def test_cwe94_closed_quoted_scalar_ends_its_value_4506308188():
+    text = WF_HEAD + '      - run: "echo hi"\n            # ${{ github.head_ref }}\n      - run: make\n'
+    assert _scan(WF, text) == []
+    open_ = WF_HEAD + '      - run: "echo hi\n          ${{ github.head_ref }}"\n'
+    assert _scan(WF, open_) == [(_line_of(open_, "head_ref"), *CWE94)]
+
+
+def test_cwe94_flow_keys_inside_quotes_are_text_4506308190():
+    sha = GH_SCRIPT.split(" ")[0]
+    decoy = WF_HEAD + f'      - {{name: "x, uses: acme/data@v1", uses: {sha}, with: {{script: "${{{{ github.event.issue.title }}}}"}}}}\n'
+    assert _scan(WF, decoy) == [(len(decoy.splitlines()), *CWE94)]
+    fake_run = WF_HEAD + '      - {name: "a, run: ${{ github.head_ref }}", uses: acme/x@' + "f" * 40 + "}\n"
+    assert _scan(WF, fake_run) == []
+
+
+def test_cwe94_flow_run_only_at_step_level_4506308192():
+    text = WF_HEAD + "      - {uses: acme/x@" + "f" * 40 + ", with: {run: '${{ github.event.issue.title }}'}}\n"
+    assert _scan(WF, text) == []
+
+
+def test_cwe94_workflow_run_head_commit_message_is_unsafe_review_nitpick():
+    assert m.UntrustedContextPolicy.classify("github.event.workflow_run.head_commit.message") == "unsafe"

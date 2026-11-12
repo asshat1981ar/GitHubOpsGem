@@ -5,6 +5,8 @@ Every subcommand reads files or stdin and writes JSON (or text where noted) to s
 Exit codes: 0 = ok / PASS / WARN, 2 = BLOCK or verification failed, 1 = usage or input error.
 
   gemctl scan-diff  --path FILE [--patch PATCHFILE|-]         findings for one file's unified diff
+                    (for a workflow, FILE is also read from disk when the patch's `index` line names
+                    it as the target blob, so the CWE-94 rule sees the YAML around each hunk)
   gemctl debt       --patch PATCHFILE|- [--has-tests] [--tests-passed yes|no]
                     [--prompt-versioned] [--provenance]        PSC / DUR / policy report
   gemctl gate       --tool T --branch B [--event APPROVE] [--payload FILE|-]
@@ -31,6 +33,7 @@ import argparse
 import dataclasses
 import json
 import os
+import stat
 import sys
 import time
 from enum import Enum
@@ -64,8 +67,38 @@ def _emit(obj: Any) -> None:
     sys.stdout.write("\n")
 
 
+POST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _post_image(path: str, patch_text: str) -> Optional[str]:
+    """Read a workflow file if its patch has a Git index line and the file is regular and at most 2 MiB.
+
+    Return None for an ineligible path or patch, a symlink at the final path component, file access errors,
+    or UTF-8 decoding errors. The scanner validates the target blob prefix and visible patch lines before
+    using the returned text as YAML context for the CWE-94 rule.
+    """
+    if not gem.SupplyChainAndSecretScanner.WORKFLOW_PATH_RE.search(path):
+        return None
+    if not gem.WorkflowInjectionScanner.INDEX_RE.search(patch_text.split("\n@@", 1)[0]):
+        return None
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > POST_IMAGE_MAX_BYTES:
+            return None
+        with open(path, encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def cmd_scan_diff(a: argparse.Namespace) -> int:
-    findings = gem.SupplyChainAndSecretScanner.audit_diff(a.path, _read(a.patch))
+    """Emit JSON findings for a patch, using an eligible workflow file as context when available.
+
+    Return 2 if fail_on_critical is set and a critical finding exists, otherwise 0. Patch read and
+    output errors propagate; an unreadable workflow context is ignored.
+    """
+    patch = _read(a.patch)
+    findings = gem.SupplyChainAndSecretScanner.audit_diff(a.path, patch, post_image=_post_image(a.path, patch))
     _emit({"path": a.path, "findings": findings,
            "critical": sum(f.severity == gem.Severity.CRITICAL for f in findings)})
     return 2 if a.fail_on_critical and any(f.severity == gem.Severity.CRITICAL for f in findings) else 0
