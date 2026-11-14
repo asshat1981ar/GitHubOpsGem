@@ -2,7 +2,6 @@
 
 ## 🟢 Ready
 - [ ] Deploy WU-07 on awsbox (human): `sudo ./lifecycle/deploy_awsbox.sh --litellm-dir <dir>` (DRY first), `--live` after a few days of logs
-- [ ] WU-05 LiteLLM gem_guardrail plugin (stream think-strip, allowlisted repair, budgets, cold-start hold)
 - [ ] WU-12 Repair SKILL.md / CLAUDE.md (control chars, tool names, dangling scripts/, repo-agnostic)
 - [ ] WU-17 Single-source spec: one spec.yaml generating CLAUDE.md, SKILL.md, knowledge pack, Linear ledger, Gem intent
 
@@ -26,6 +25,7 @@
 - [ ] Z3/SMT invariant discharge for arithmetic/bounds properties
 
 ## ✅ Done
+- [x] WU-05 LiteLLM gem_guardrail plugin implemented (`gateway/gem_guardrail.py`, 36 tests per GRAPH; they skip without litellm). Local LiteLLM boot with the guardrail and the live proxy run are not recorded: verify under WU-06
 - [x] WU-01 Adversarial audit — 19 probes, 19 confirmed on v5
 - [x] WU-02 gemcore v5.1 — 80 tests, 0/19 probes on v5.1
 - [x] WU-02b gemcore v5.2 — unified-spec rules, 93 tests

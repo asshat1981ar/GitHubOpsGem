@@ -14,7 +14,7 @@
 | WU-05 | LiteLLM `gem_guardrail.py` plugin | sub-agent + LiteLLM 1.108.2 source | WU-02, WU-03 | unit tests with mocked streams; litellm boots with guardrail | ✅ (36 tests; both routes; live proxy pending) |
 | WU-06 | Gateway conformance harness (= PRO-78 open criterion: live smoke on AutoDev + Chimera worktrees) | bash on awsbox (human runs) | WU-03, WU-05 | 6/6 checks green against live gateway on both worktrees | ⬜ |
 | WU-07 | Deployment lifecycle controller | bash + systemd + LiteLLM callback | WU-04 | dry-run: idle 3m→sleep, SessionEnd+45s→sleep, cap trips, auto-delete guard | ✅ (dry-run 9/9; live run on awsbox pending) |
-| WU-08 | Claude Code policy hooks (Termux) | bash | WU-04, WU-07 | hook tests: push main WARN/BLOCK, MCP write gated, wake/sleep fired | ⬜ |
+| WU-08 | Claude Code policy hooks (Termux) | bash | WU-04, WU-07 | hook tests: push main WARN/BLOCK, MCP write gated, wake/sleep fired | ✅ (code + installer done; installing on Termux, which starts the warn-week clock, is a human step) |
 | WU-09 | ForgeCore-signed verdicts (ADR-007) → git trailers | AutoDev PR #55 + bash | WU-08 | kernel attest/verify live; trailer carries attestation_id; /verify rejects tampered | 🟡 (PR #55 draft; trailers pending) |
 | WU-10 | Server-side gem-review workflow + rulesets | sub-agent + actionlint + zizmor | WU-04 | required check on pilot repo; workflow passes its own scanner | 🟡 (workflow done, lint-clean; repo + ruleset need Aaron) |
 | WU-11 | Warn-week telemetry → per-rule graduation | self-improving-proactive-agent | WU-08 (+7 days) | report with hits/FP per rule; graduated rules listed | ⬜ |
@@ -144,11 +144,13 @@ workflow_unit:
 ## Handoff Note
 
 - **Done:** WU-01 audit, WU-02/02b gemcore, WU-04 gemctl, WU-07 lifecycle controller (dry-run 9/9), WU-08 hooks
-  (PreToolUse, SessionStart, SessionEnd) + installer, WU-09a ForgeCore attestation (AutoDev PR #55, draft).
-- **Next runnable:** WU-05 LiteLLM guardrail (stream think-strip). Human: deploy WU-07 on awsbox in DRY mode,
-  install hooks on Termux (starts the warn week), merge AutoDev #56 then review #55.
-- **Exact resume point:** `gateway/gem_guardrail.py` — `async_post_call_streaming_iterator_hook` wrapping
-  `gemcore.ThinkStreamFilter`; test against LiteLLM 1.108.2 (installed in the workspace) like WU-07's callback.
+  (PreToolUse, SessionStart, SessionEnd) + installer, WU-09a ForgeCore attestation (AutoDev PR #55, draft),
+  WU-05 guardrail (`gateway/gem_guardrail.py`; local boot and live proxy run still pending, see WU-06).
+- **Next runnable (no human needed):** WU-12 CLAUDE.md / SKILL.md repair, then WU-17 single-source spec.
+  Human: deploy WU-07 on awsbox in DRY mode, install hooks on Termux (starts the warn week), merge AutoDev #56
+  then review #55, then run WU-06 against the live gateway.
+- **Exact resume point:** WU-12 — repair `CLAUDE.md` (control characters, tool names, dangling references) and
+  record the result here; WU-05's local LiteLLM boot with the guardrail enabled is verified as part of WU-06.
 - **Open assumptions:** $13/GPU-hour B200 rate; GEM_ENFORCE_AFTER=2026-11-14; the REST deployment response may
   omit the auto-delete field (operator sets GEM_AUTODELETE_VERIFIED=1 after `firectl get deployment`).
 - **Pending gate failures:** WU-03 cannot pass until WU-06 runs against the live gateway; WU-07's live gate
