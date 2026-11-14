@@ -1,0 +1,230 @@
+# Deterministic work-unit assignments. Apply `rules` in order to a unit's `facts`; the first rule whose `when`
+# matches fixes owner_type, agent, skill and reviewer. tests/test_assignments.py recomputes every entry.
+# To change an assignment, change the unit's facts or a rule, never the derived fields by hand.
+#
+# `when` keys (all listed keys must match; an empty `when` always matches):
+#   needs_host        true  -> facts.needs_host is non-empty (awsbox, termux)
+#   external_write    true  -> facts.external_write is true (tracker, ruleset or repo-settings writes)
+#   human_gated       true  -> facts.human_gates is non-empty (a gate in `human_gates` is unresolved)
+#   v2                true  -> facts.v2 is true
+#   touches_gate_path true  -> any of facts.paths starts with a gate path (see `gate_paths`)
+#   docs_only         true  -> facts.docs_only is true
+# Re-run the rules with human_gates emptied once a gate resolves.
+
+gate_paths:
+  - mcp_reference_monitor.py
+  - lifecycle/
+  - hooks/
+  - ci/
+  - .github/
+
+human_gates:
+  H1: "Enforce-date decision (GEM_ENFORCE_AFTER). Aaron decides; no agent picks a date."
+  H2: "ForgeCore deployed with the ADR-007 gate routes (AutoDev PRs #55 and #56 merged and live on awsbox)."
+  H3: "awsbox deploy of the lifecycle controller (human, DRY mode first)."
+  H4: "Hooks installed on Termux (starts the warn-week clock)."
+  H5: "Linear reconnected (the connector failed to connect when this was written)."
+
+rules:
+  - id: R-HOST
+    when: {needs_host: true}
+    then: {owner_type: human, agent: null, skill: null, reviewer: null}
+  - id: R-EXT
+    when: {external_write: true}
+    then: {owner_type: human, agent: null, skill: null, reviewer: null}
+  - id: R-GATED
+    when: {human_gated: true}
+    then: {owner_type: human, agent: null, skill: null, reviewer: null}
+  - id: R-V2
+    when: {v2: true}
+    then: {owner_type: agent, agent: Plan, skill: "agent-protocols:research-spike-and-poc",
+           reviewer: "agent-protocols:spec-analyst"}
+  - id: R-GATE
+    when: {touches_gate_path: true}
+    then: {owner_type: agent, agent: general-purpose, skill: "agent-protocols:test-driven-development",
+           reviewer: "agent-protocols:security-auditor"}
+  - id: R-DOCS
+    when: {docs_only: true}
+    then: {owner_type: agent, agent: "agent-protocols:documentation-specialist",
+           skill: "agent-protocols:documentation-and-adrs", reviewer: "agent-protocols:code-reviewer"}
+  - id: R-DEFAULT
+    when: {}
+    then: {owner_type: agent, agent: general-purpose, skill: "agent-protocols:test-driven-development",
+           reviewer: "agent-protocols:code-reviewer"}
+
+units:
+  - unit: deploy-wu07
+    queue_line: "Deploy WU-07 on awsbox"
+    facts: {needs_host: awsbox, paths: [lifecycle/]}
+    gate_command: "sudo ./lifecycle/deploy_awsbox.sh --litellm-dir <dir>"
+    depends_on: []
+    rule: R-HOST
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-12
+    queue_line: "WU-12 Repair"
+    facts: {docs_only: true, paths: [CLAUDE.md]}
+    gate_command: "python3 -m pytest -q"
+    depends_on: []
+    rule: R-DOCS
+    owner_type: agent
+    agent: "agent-protocols:documentation-specialist"
+    skill: "agent-protocols:documentation-and-adrs"
+    reviewer: "agent-protocols:code-reviewer"
+
+  - unit: WU-17
+    queue_line: "WU-17 Single-source"
+    facts: {paths: [CLAUDE.md, state/]}
+    gate_command: "python3 -m pytest -q"
+    depends_on: [WU-12]
+    rule: R-DEFAULT
+    owner_type: agent
+    agent: general-purpose
+    skill: "agent-protocols:test-driven-development"
+    reviewer: "agent-protocols:code-reviewer"
+
+  - unit: WU-03
+    queue_line: "WU-03 Gateway config"
+    facts: {needs_host: awsbox, paths: [gateway/]}
+    gate_command: "python3 conformance_check.py  # not in the repo yet; see WU-06"
+    depends_on: [WU-06]
+    rule: R-HOST
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-06
+    queue_line: "WU-06 Conformance"
+    facts: {needs_host: awsbox, paths: [gateway/]}
+    gate_command: "python3 conformance_check.py  # not in the repo yet"
+    depends_on: [deploy-wu07, H3]
+    rule: R-HOST
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: termux-hooks
+    queue_line: "Install WU-08 hooks on Termux"
+    facts: {needs_host: termux, paths: [hooks/]}
+    gate_command: "python3 install_hooks.py"
+    depends_on: []
+    rule: R-HOST
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-09b
+    queue_line: "WU-09b Git trailers"
+    facts: {human_gates: [H2], paths: [gem_trailers.py]}
+    gate_command: "python3 e2e_forgecore.py"
+    depends_on: [H2]
+    rule: R-GATED
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-10
+    queue_line: "WU-10 Server-side"
+    facts: {external_write: true, paths: [ci/, .github/]}
+    gate_command: "./ci/apply_rulesets.sh"
+    depends_on: []
+    rule: R-EXT
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-11
+    queue_line: "WU-11 Warn-week"
+    facts: {human_gates: [H1, H4], paths: [gemctl.py]}
+    gate_command: "python3 gemctl.py graduation-report  # command does not exist yet"
+    depends_on: [H1, H4]
+    rule: R-GATED
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-13
+    queue_line: "WU-13 Opal"
+    facts: {paths: []}
+    gate_command: "python3 -m pytest -q"
+    depends_on: []
+    rule: R-DEFAULT
+    owner_type: agent
+    agent: general-purpose
+    skill: "agent-protocols:test-driven-development"
+    reviewer: "agent-protocols:code-reviewer"
+
+  - unit: WU-14
+    queue_line: "WU-14 Tech-debt"
+    facts: {paths: [mcp_reference_monitor.py]}
+    gate_command: "python3 -m pytest -q && python3 -I probes.py mcp_reference_monitor.py"
+    depends_on: []
+    rule: R-GATE
+    owner_type: agent
+    agent: general-purpose
+    skill: "agent-protocols:test-driven-development"
+    reviewer: "agent-protocols:security-auditor"
+
+  - unit: WU-16
+    queue_line: "WU-16 Delivery"
+    facts: {human_gates: [H2], paths: [state/]}
+    gate_command: "python3 -m pytest -q"
+    depends_on: [WU-06, WU-12, WU-17, H2]
+    rule: R-GATED
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-18
+    queue_line: "WU-18 Evidence"
+    facts: {external_write: true, human_gates: [H2, H5], paths: []}
+    gate_command: "n/a (Linear writes need Aaron's confirmation)"
+    depends_on: [WU-06, WU-09b, H2, H5]
+    rule: R-EXT
+    owner_type: human
+    agent: null
+    skill: null
+    reviewer: null
+
+  - unit: WU-15
+    queue_line: "WU-15 aTRIZ-SWE advisory"
+    facts: {v2: true, paths: []}
+    gate_command: "python3 -m pytest -q"
+    depends_on: [WU-14]
+    rule: R-V2
+    owner_type: agent
+    agent: Plan
+    skill: "agent-protocols:research-spike-and-poc"
+    reviewer: "agent-protocols:spec-analyst"
+
+  - unit: lats
+    queue_line: "LATS search"
+    facts: {v2: true, paths: []}
+    gate_command: "n/a (spike first)"
+    depends_on: []
+    rule: R-V2
+    owner_type: agent
+    agent: Plan
+    skill: "agent-protocols:research-spike-and-poc"
+    reviewer: "agent-protocols:spec-analyst"
+
+  - unit: z3
+    queue_line: "Z3/SMT"
+    facts: {v2: true, paths: []}
+    gate_command: "n/a (spike first)"
+    depends_on: []
+    rule: R-V2
+    owner_type: agent
+    agent: Plan
+    skill: "agent-protocols:research-spike-and-poc"
+    reviewer: "agent-protocols:spec-analyst"

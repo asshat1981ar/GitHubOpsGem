@@ -2894,6 +2894,13 @@ class StatefulGitHubOpsMonitor:
             decision, allowed = "BLOCK", False
         self.phase = WorkflowPhase.COMMIT if allowed else WorkflowPhase.GATE
         if self.attestor is None:
+            facts["attestation"] = "not_configured"
+            if mode == EnforcementMode.ENFORCE and (privileged or tool_name in self.WRITE_TOOLS):
+                # A local HMAC verdict is not evidence (ADR-007); an unsigned write must not pass in ENFORCE.
+                v.append("No ForgeCore attestor configured (AUTODEV_URL and AUTODEV_API_BEARER_TOKEN): "
+                         "unsigned write blocked in ENFORCE.")
+                self.phase = WorkflowPhase.GATE
+                return GateDecision(False, "BLOCK", v, tool_name, target_branch, mode, facts)
             gd = GateDecision(allowed, decision, v, tool_name, target_branch, mode, facts)
             gd.signature = self.signer.sign(gd.payload())   # local HMAC: dev fallback, not trusted evidence
             return gd
