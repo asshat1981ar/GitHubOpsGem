@@ -37,13 +37,17 @@ def test_gemctl_scan_diff_flags_unpinned_action(tmp_path):
     assert r.returncode == 2 and out["critical"] == 1 and out["findings"][0]["category"] == "UNPINNED_ACTION_SHA"
 
 
-def test_gemctl_gate_exit_codes():
+def test_gemctl_gate_exit_codes(kernel_url):
+    signed = {"AUTODEV_URL": kernel_url, "AUTODEV_API_BEARER_TOKEN": "t"}
     block = run([GEMCTL, "gate", "--tool", "push_files", "--branch", "refs/heads/main", "--mode", "enforce"])
     warn = run([GEMCTL, "gate", "--tool", "push_files", "--branch", "main", "--mode", "warn"])
-    ok = run([GEMCTL, "gate", "--tool", "push_files", "--branch", "feat/x", "--mode", "enforce"])
+    ok = run([GEMCTL, "gate", "--tool", "push_files", "--branch", "feat/x", "--mode", "enforce"], env_extra=signed)
+    unsigned = run([GEMCTL, "gate", "--tool", "push_files", "--branch", "feat/x", "--mode", "enforce"])
     assert block.returncode == 2 and json.loads(block.stdout)["decision"] == "BLOCK"
     assert warn.returncode == 0 and json.loads(warn.stdout)["decision"] == "WARN"
     assert ok.returncode == 0 and json.loads(ok.stdout)["decision"] == "PASS"
+    # no ForgeCore configured: ENFORCE blocks even a feature-branch push
+    assert unsigned.returncode == 2 and "attestor" in unsigned.stdout
 
 
 def test_gemctl_gate_xml_and_payload_secret(tmp_path):
@@ -108,8 +112,9 @@ def test_protected_push_warns_in_warn_mode_without_forgecore(tmp_path):
     assert "additionalContext" in out["hookSpecificOutput"]
 
 
-def test_feature_push_passes_silently_and_never_emits_allow(tmp_path):
-    out = hook("Bash", {"command": "git push -u origin feat/gem-gate"}, mode="ENFORCE", gem_home=tmp_path)
+def test_feature_push_passes_silently_and_never_emits_allow(tmp_path, kernel_url):
+    out = hook("Bash", {"command": "git push -u origin feat/gem-gate"}, mode="ENFORCE", gem_home=tmp_path,
+               extra={"AUTODEV_URL": kernel_url, "AUTODEV_API_BEARER_TOKEN": "t"})
     assert out == {}
     ev = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     assert ev["decision"] == "PASS" and ev["target"] == "feat/gem-gate" and ev["rules"] == []
@@ -128,14 +133,15 @@ def test_bare_git_push_resolves_current_branch(tmp_path):
     assert decision(out) == "deny" and "main" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_mcp_push_files_secret_and_branch(tmp_path):
+def test_mcp_push_files_secret_and_branch(tmp_path, kernel_url):
     files = [{"path": "a.py", "content": "KEY = 'fw_" + "A" * 30 + "'"}]
     out = hook("mcp__github__push_files", {"owner": "o", "repo": "r", "branch": "feat/x", "files": files},
                mode="ENFORCE", gem_home=tmp_path)
     assert decision(out) == "deny" and "FIREWORKS_KEY" in out["hookSpecificOutput"]["permissionDecisionReason"]
     clean = hook("mcp__github__push_files", {"owner": "o", "repo": "r", "branch": "feat/x",
                                              "files": [{"path": "a.py", "content": "x = 1"}]},
-                 mode="ENFORCE", gem_home=tmp_path)
+                 mode="ENFORCE", gem_home=tmp_path,
+                 extra={"AUTODEV_URL": kernel_url, "AUTODEV_API_BEARER_TOKEN": "t"})
     assert clean == {}
 
 
