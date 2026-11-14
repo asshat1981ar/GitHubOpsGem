@@ -120,6 +120,12 @@ def test_feature_push_passes_silently_and_never_emits_allow(tmp_path, kernel_url
     assert ev["decision"] == "PASS" and ev["target"] == "feat/gem-gate" and ev["rules"] == []
 
 
+def test_feature_push_denied_in_enforce_without_forgecore(tmp_path):
+    out = hook("Bash", {"command": "git push -u origin feat/gem-gate"}, mode="ENFORCE", gem_home=tmp_path)
+    assert decision(out) == "deny"
+    assert "No ForgeCore attestor" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
 def test_force_push_to_feature_branch_is_flagged(tmp_path):
     out = hook("Bash", {"command": "git push --force-with-lease origin feat/x"}, mode="WARN", gem_home=tmp_path)
     assert "Force push" in out["systemMessage"]
