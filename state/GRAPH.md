@@ -14,7 +14,7 @@
 | WU-05 | LiteLLM `gem_guardrail.py` plugin | sub-agent + LiteLLM 1.108.2 source | WU-02, WU-03 | unit tests with mocked streams; litellm boots with guardrail | ✅ (36 tests; both routes; live proxy pending) |
 | WU-06 | Gateway conformance harness (= PRO-78 open criterion: live smoke on AutoDev + Chimera worktrees) | bash on awsbox (human runs) | WU-03, WU-05 | 6/6 checks green against live gateway on both worktrees | ⬜ |
 | WU-07 | Deployment lifecycle controller | bash + systemd + LiteLLM callback | WU-04 | dry-run: idle 3m→sleep, SessionEnd+45s→sleep, cap trips, auto-delete guard | ✅ (dry-run 9/9; live run on awsbox pending) |
-| WU-08 | Claude Code policy hooks (Termux) | bash | WU-04, WU-07 | hook tests: push main WARN/BLOCK, MCP write gated, wake/sleep fired | ⬜ |
+| WU-08 | Claude Code policy hooks (Termux) | bash | WU-04, WU-07 | hook tests: push main WARN/BLOCK, MCP write gated, wake/sleep fired | ✅ (code + installer done; installing on Termux, which starts the warn-week clock, is a human step) |
 | WU-09 | ForgeCore-signed verdicts (ADR-007) → git trailers | AutoDev PR #55 + bash | WU-08 | kernel attest/verify live; trailer carries attestation_id; /verify rejects tampered | 🟡 (PR #55 draft; trailers pending) |
 | WU-10 | Server-side gem-review workflow + rulesets | sub-agent + actionlint + zizmor | WU-04 | required check on pilot repo; workflow passes its own scanner | 🟡 (workflow done, lint-clean; repo + ruleset need Aaron) |
 | WU-11 | Warn-week telemetry → per-rule graduation | self-improving-proactive-agent | WU-08 (+7 days) | report with hits/FP per rule; graduated rules listed | ⬜ |
