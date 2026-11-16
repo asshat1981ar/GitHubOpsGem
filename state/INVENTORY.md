@@ -28,6 +28,13 @@ did not connect in the session this was written) · **out-of-scope** (reachable 
 | `hooks/gem_session_end.py` | 37 | Tells the controller the session ended |
 | `hooks/gem_fileguard.py` | 30 | Fast guard: file tools never touch B200 operator credentials |
 | `ci/apply_rulesets.sh` | 23 | Applies `ci/rulesets/*.json` with `gh` |
+| `adaptive_workflow_engine.py` | 1013 | Multi-repo workflow engine from gem-v5.8 (GC-001 port); advisory, not wired into hooks or CI |
+| `gateway/conformance_check.py` | 198 | 6 deterministic gateway checks: think strip, tool-repair boundary, 96k pre-call cap, tier isolation, auth, tiers |
+| `learning/graduation_readiness.py` | 49 | Warn-week graduation readiness check (gem-v5.8) |
+| `learning/graduation_report.py` | 75 | Warn-week report: findings, overrides, which rules are ready for ENFORCE (gem-v5.8) |
+| `learning/tech_debt_v2.py` | 192 | AST tech-debt scanner v2 (gem-v5.8) |
+| `learning/lats_symbolic_engine.py` | 211 | LATS search and symbolic bounds prover (gem-v5.8) |
+| `state/render_spec.py` | 140 | Renders CLAUDE.md, SKILL.md and 3 state/reference views from `state/spec.yaml`; `--check` for drift |
 
 Tests live in `tests/` (about 500 cases; CI's `pytest` check is the count of record).
 

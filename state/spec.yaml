@@ -1,0 +1,55 @@
+{
+  "version": "5.7.0",
+  "context_window": 131072,
+  "input_budget_tokens": 96000,
+  "output_budget_tokens": 16384,
+  "serverless_model": "openai/accounts/fireworks/models/deepseek-v4p1-flash-1017",
+  "serverless_daily_cap_usd": 10,
+  "b200_daily_cap_usd": 26,
+  "b200_weekly_cap_usd": 78,
+  "b200_idle_sleep_s": 180,
+  "b200_session_end_sleep_s": 45,
+  "tools": {
+    "low_cost": [
+      "Read",
+      "Grep",
+      "Glob",
+      "LS",
+      "NotebookRead",
+      "TodoWrite"
+    ],
+    "heavy": [
+      "Edit",
+      "MultiEdit",
+      "Write",
+      "NotebookEdit",
+      "Bash",
+      "Task",
+      "Agent"
+    ],
+    "safe_repair": [
+      "Read",
+      "Grep",
+      "Glob",
+      "LS"
+    ]
+  },
+  "protected_branches": [
+    "main",
+    "master",
+    "production",
+    "prod",
+    "trunk",
+    "release/*",
+    "hotfix/*"
+  ],
+  "stages": [
+    "DISCOVER & BIND",
+    "INGEST & QUARANTINE",
+    "GRAPH & BLAST RADIUS",
+    "ANALYZE",
+    "PRE-FLIGHT GATE",
+    "RECOVER"
+  ],
+  "enforce_after_source": "GEM_ENFORCE_AFTER in gateway/claude-gem.env"
+}
