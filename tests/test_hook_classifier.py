@@ -122,3 +122,115 @@ def test_protected_branch_deny_keeps_the_branch_hint():
     d = gem.GateDecision(False, "BLOCK", ["Direct write to protected branch 'main' is forbidden."], "git_push", "main",
                          gem.EnforcementMode.ENFORCE, {})
     assert "feat/<slug>" in hook.respond([d], "Bash")["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ---------------------------------------------------------------- review round 2 (adversarial probes)
+
+@pytest.mark.parametrize("cmd", [
+    # heredocs: the body can be a script, or hold a live $(...)
+    "bash <<EOF\ngit push origin main\nEOF",
+    "cat <<EOF\n$(git push origin main)\nEOF",
+    "echo <<EOF\nEOF\ngit push origin main\nEOF",
+    "echo '<<EOF'\ngit push origin main\nEOF",
+    "echo hi # <<EOF\ngit push origin main\nEOF",
+    "echo $((1<<EOF))\ngit push origin main\nEOF",
+    # wrapper options and path-qualified binaries
+    "sudo -u root git push origin main",
+    "sudo -E git push origin main",
+    "sudo -- git push origin main",
+    "env -i git push origin main",
+    "env -u X git push origin main",
+    "nice -n 5 git push origin main",
+    "command -p git push origin main",
+    "time -p git push origin main",
+    "timeout 5 git push origin main",
+    "timeout 5 sh -c 'git push origin main'",
+    "setsid git push origin main",
+    "/usr/bin/git push origin main",
+    "./git push origin main",
+    # shell grammar
+    "(git push origin main)",
+    "{ git push origin main; }",
+    "if true; then git push origin main; fi",
+    "for i in 1; do git push origin main; done",
+    "! git push origin main",
+    # nesting and xargs
+    "echo $(echo $(echo $(echo $(git push origin main))))",
+    "xargs sh -c 'git push origin main'",
+    "xargs -I{} sh -c 'git push {}'",
+    # redirection glued to the refspec, trailing comment, push options
+    "git push origin main>/dev/null",
+    "git push origin main #comment",
+    "git push -o ci.skip origin main",
+    # gh global flags
+    "gh -R a/b pr merge 5",
+    "gh --repo a/b pr merge 5",
+])
+def test_review_round2_bypasses_are_classified(cmd):
+    assert any(t.startswith("git_") or t == "merge_pull_request" for t, _ in writes(cmd)), cmd
+
+
+def test_gh_global_flags_do_not_hide_pr_create():
+    assert writes("gh -R a/b pr create --head feat/x") == [("create_pull_request", "feat/x")]
+
+
+def test_push_option_value_is_not_a_second_target():
+    assert writes("git push -o ci.skip origin feat/x") == [("git_push", "feat/x")]
+    assert writes("git push origin main #comment") == [("git_push", "main")]
+
+
+def test_heredoc_to_a_non_shell_is_still_data():
+    cmd = "cat > notes.txt <<'EOF'\ngit push origin main\n`git push origin main`\nEOF"
+    assert writes(cmd) == []
+
+
+def test_unterminated_heredoc_fails_closed():
+    assert writes("cat <<EOF\ngit push origin main") != []
+
+
+@pytest.mark.parametrize("make", [
+    lambda: "git push origin " + "a" * 2_000_000,
+    lambda: "echo '" + "x" * 1_000_000,
+    lambda: 'echo "' + "x" * 1_000_000,
+    lambda: "echo " + "\\" * 1_000_000,
+    lambda: 'echo "$(echo x)"' * 30_000,
+    lambda: "cat <<EOF\n" * 14_000,
+    lambda: "echo hi;" * 250_000,
+])
+def test_pathological_input_is_bounded(make):
+    import time
+    cmd = make()
+    t0 = time.monotonic()
+    out = hook.classify_bash(cmd, "/tmp")
+    assert time.monotonic() - t0 < 2.0
+    assert isinstance(out, list)
+
+
+def test_oversized_command_mentioning_a_push_is_not_waved_through():
+    out = hook.classify_bash("git push origin main " + "x" * 200_000, "/tmp")
+    assert out and any("too long" in e for w in out for e in w["extra"])
+
+
+def test_oversized_command_without_a_push_is_ignored():
+    assert hook.classify_bash("echo " + "x" * 200_000, "/tmp") == []
+
+
+# ---------------------------------------------------------------- deny wording
+
+def test_missing_config_and_outage_get_different_hints():
+    cfg = gem.GateDecision(False, "BLOCK", ["No ForgeCore attestor configured (AUTODEV_URL ...): unsigned write "
+                                            "blocked in ENFORCE."], "git_push", "feat/x", gem.EnforcementMode.ENFORCE, {})
+    out = gem.GateDecision(False, "BLOCK", ["ForgeCore attestation unavailable, failing closed: down"], "git_push",
+                           "feat/x", gem.EnforcementMode.ENFORCE, {})
+    r_cfg = hook.respond([cfg], "Bash")["hookSpecificOutput"]["permissionDecisionReason"]
+    r_out = hook.respond([out], "Bash")["hookSpecificOutput"]["permissionDecisionReason"]
+    for r in (r_cfg, r_out):
+        assert "feat/<slug>" not in r and "Tell the user" in r and "plain terminal" not in r
+    assert "not configured" in r_cfg and "did not answer" in r_out
+
+
+def test_nesting_past_the_limit_fails_closed():
+    deep = "$(" * 12 + "git push origin main" + ")" * 12
+    out = hook.classify_bash(deep, "/tmp")
+    assert out and any("too long" in e for w in out for e in w["extra"])
+    assert hook.classify_bash("$(" * 12 + "echo hi" + ")" * 12, "/tmp") == []
