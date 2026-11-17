@@ -3,7 +3,7 @@
 | Path | What |
 |---|---|
 | `mcp_reference_monitor.py` | gemcore v5.4 (v5.1 audit fixes, v5.2 unified-spec rules, v5.3 ForgeCore client, v5.4 shell-push coverage) |
-| `tests/` | 379 tests — `python3 -m pytest -q` (the deploy end-to-end tests need root) |
+| `tests/` | full suite — `python3 -m pytest -q` (the deploy end-to-end tests need root; tests needing litellm, actionlint, zizmor or shellcheck skip when those are not installed). CI's `pytest` check is the count of record |
 | `gemctl.py` | CLI: `scan-diff`, `debt`, `gate`, `ci-window`, `strip`, `verify`, `heavy on/off/status`, `trailer add/note/verify/install-hook`, `version`; JSON out, exit 2 = BLOCK |
 | `gem_trailers.py` | `Gem-Gate:` commit trailers + `refs/notes/gem-gate` attestations, verified against ForgeCore (WU-09b) |
 | `hooks/gem_pretool.py` | Claude Code PreToolUse gate for `git push`, `gh pr merge` and GitHub MCP writes; always denies the model operating the B200 |
@@ -26,7 +26,7 @@
 | `gateway/litellm_config.v7.yaml` | DRAFT gateway config: serverless-first, B200 burst, $10/day serverless budget (not yet run against LiteLLM) |
 | `e2e_forgecore.py` | End-to-end check against a running autodev-server (ADR-007, AutoDev PR #55) |
 | `gateway/claude-gem.env` | Claude Code client env for Termux |
-| `CLAUDE.md` | v5.1 operational profile (repo-agnostic) |
+| `CLAUDE.md` | operational profile (repo-agnostic) |
 | `state/GOAL_CONTRACT.yaml`, `state/GRAPH.md`, `tasks/QUEUE.md` | workflow-kernel state — resume from GRAPH.md |
 | `pm/backlog.csv`, `pm/rice_report.txt` | RICE inputs and output |
 | `learning/gateway_learning_hooks.md` | event schema, failure taxonomy, per-rule graduation |
@@ -51,7 +51,7 @@ unzip gem-v5.6.zip -d ~/gem-src && cd ~/gem-src/gem
 sudo ./lifecycle/deploy_awsbox.sh --litellm-dir <your LiteLLM config dir>   # first run: DRY mode
 ```
 
-The script is idempotent: preflight (Python 3.9+, tz data, systemd, a 9/9 self-test on this host), `gem` service user,
+The script is idempotent: preflight (Python 3.9+, tz data, systemd, the controller's dry-run self-test on this host), `gem` service user,
 `/opt/gem`, `/etc/gem/lifecycle.env` (0640 root:gem; prompts for the Fireworks key, generates the controller token,
 never prints either), a live check of the deployment, the hardened systemd unit, a health and status probe, and the
 LiteLLM callback. It asks once about auto-delete, which the Fireworks API can't report:

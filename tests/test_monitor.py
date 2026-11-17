@@ -16,7 +16,20 @@ ENFORCE = m.GemConfig(deployment_id="accounts/t/deployments/t", mode=m.Enforceme
 WARN = m.GemConfig(deployment_id="accounts/t/deployments/t", mode=m.EnforcementMode.WARN)
 
 
+class _PolicyAttestor:
+    """Stand-in for ForgeCore: derives the decision from the client's violations, like the kernel contract
+    (ADR-007). ENFORCE now blocks writes that have no attestor (tests/test_attestor_required.py), so tests of
+    the policy rules themselves run against this stub instead of the local HMAC fallback."""
+
+    def attest(self, claim):
+        v = claim["violations"]
+        decision = "PASS" if not v else ("WARN" if claim["mode"] == "warn" else "BLOCK")
+        return {"decision": decision, "kernel_violations": [], "attestation_id": "a" * 32,
+                "key_id": "k" * 16, "signature": "f" * 64}
+
+
 def mon(cfg=ENFORCE, **kw):
+    kw.setdefault("attestor", _PolicyAttestor())
     return m.StatefulGitHubOpsMonitor(config=cfg, signer=m.ReceiptSigner(b"test-key"), **kw)
 
 
@@ -322,12 +335,13 @@ def test_config_from_env():
 
 def test_signed_gate_receipt_verifies_and_detects_tamper():
     signer = m.ReceiptSigner(b"test-key")
-    gd = mon().evaluate_write("create_pull_request", "feat/x")
+    # The local HMAC receipt is the WARN-mode dev fallback (no attestor); ENFORCE blocks unsigned writes instead.
+    gd = m.StatefulGitHubOpsMonitor(config=WARN, signer=signer).evaluate_write("create_pull_request", "feat/x")
     assert gd.signature and signer.verify(gd.payload(), gd.signature)
-    forged = dict(gd.payload(), decision="PASS", violations=["x"])
+    forged = dict(gd.payload(), decision="BLOCK", violations=["x"])
     assert not signer.verify(forged, gd.signature)
     xml = gd.to_xml()
-    assert xml.startswith(f'<PreFlightGate generator="gemcore/{m.__version__}" signature=') and "<gate_decision mode=\"ENFORCE\">PASS" in xml
+    assert xml.startswith(f'<PreFlightGate generator="gemcore/{m.__version__}" signature=') and "<gate_decision mode=\"WARN\">PASS" in xml
 
 
 def test_unsigned_when_no_key(monkeypatch):
@@ -363,7 +377,8 @@ def test_strict_policy_blocks_untested_clean_merge():
     clean = "@@ -1 +1 @@\n+x = compute()\n"
     rep = m.LLMTechnicalDebtSensor.evaluate_patch(clean, has_tests=False, has_prompt_versioning=True, has_provenance_receipt=True)
     strict = mon(); strict.ingest_pull_request_files([{"filename": "a.py", "patch": clean}])
-    smell = m.StatefulGitHubOpsMonitor(config=ENFORCE, signer=m.ReceiptSigner(b"k"), fast_integration_policy="smell")
+    smell = m.StatefulGitHubOpsMonitor(config=ENFORCE, signer=m.ReceiptSigner(b"k"), fast_integration_policy="smell",
+                                       attestor=_PolicyAttestor())
     smell.ingest_pull_request_files([{"filename": "a.py", "patch": clean}])
     assert strict.evaluate_write("merge_pull_request", "feat/x", debt_report=rep).decision == "BLOCK"
     assert smell.evaluate_write("merge_pull_request", "feat/x", debt_report=rep).decision == "PASS"
