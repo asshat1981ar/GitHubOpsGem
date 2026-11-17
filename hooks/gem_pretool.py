@@ -41,6 +41,7 @@ RULES: List[Tuple[str, str]] = [
     ("Outbound payload contains credential", "SECRET_PAYLOAD"),
     ("Active prompt-injection alert", "INJECTION_TAINT"),
     ("Review/merge action without ingested PR evidence", "MERGE_NO_EVIDENCE"),
+    ("No ForgeCore attestor configured", "ATTESTOR_MISSING"),
     ("ForgeCore attestation unavailable", "ATTESTATION_UNAVAILABLE"),
     ("Fast-integration debt", "FAST_INTEGRATION"),
     ("House-policy calls", "POLICY_CALLS"),
@@ -52,7 +53,91 @@ RULES: List[Tuple[str, str]] = [
     ("Hook error", "HOOK_ERROR"),
 ]
 
-SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+WRAPPERS = {"sudo", "env", "command", "exec", "nohup", "time", "nice", "builtin"}
+MAX_NESTING = 3
+HEREDOC = re.compile(r"(<<-?\s*(['\"]?)([A-Za-z_]\w*)\2[^\n]*)\n.*?\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+
+
+def _strip_heredocs(command: str) -> str:
+    """Heredoc bodies are data (commit messages, scripts written to files), not commands."""
+    return HEREDOC.sub(r"\1", command)
+
+
+def _split_top_level(command: str) -> List[str]:
+    """Split on ; & && | || and newlines that are outside quotes. `>&` / `&>` redirections are not separators."""
+    segments: List[str] = []
+    cur: List[str] = []
+    quote: Optional[str] = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if c == "\\" and quote != "'" and i + 1 < n:
+            cur.append(command[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c in ";|\n" or (c == "&" and not (i > 0 and command[i - 1] in "<>") and command[i + 1:i + 2] != ">"):
+            segments.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    segments.append("".join(cur))
+    return [x.strip() for x in segments if x.strip()]
+
+
+REDIRECT = re.compile(r"^(?:\d*(?:>>?|<)&?|&>>?)(.*)$")
+
+
+def _strip_redirections(argv: List[str]) -> List[str]:
+    """Drop `2>&1`, `> file`, `>>file`, `< file` so they are not mistaken for refspecs."""
+    out: List[str] = []
+    skip = False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        m = REDIRECT.match(tok)
+        if m:
+            skip = not m.group(1)  # bare operator: the next token is its target
+            continue
+        out.append(tok)
+    return out
+
+
+def _substitutions(command: str) -> List[str]:
+    """Bodies of $(...) and `...` outside single quotes (they run even inside double quotes)."""
+    found: List[str] = []
+    in_single = False
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if c == "\\" and not in_single:
+            i += 2
+            continue
+        if c == "'":
+            in_single = not in_single
+        elif not in_single and command.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += (command[j] == "(") - (command[j] == ")")
+                j += 1
+            found.append(command[i + 2:j - 1] if depth == 0 else command[i + 2:])
+            i = j
+            continue
+        elif not in_single and c == "`":
+            j = command.find("`", i + 1)
+            found.append(command[i + 1:j] if j != -1 else command[i + 1:])
+            i = (j if j != -1 else n) + 1
+            continue
+        i += 1
+    return found
 
 
 # --------------------------------------------------------------------------- classification
@@ -81,17 +166,38 @@ def _repo_slug(cwd: Optional[str]) -> str:
     return m.group(1) if m else "unknown/unknown"
 
 
-def classify_bash(command: str, cwd: Optional[str]) -> List[Dict[str, Any]]:
-    """Return one write description per gated git/gh operation in a shell command."""
+def classify_bash(command: str, cwd: Optional[str], depth: int = 0) -> List[Dict[str, Any]]:
+    """Return one write description per gated git/gh operation in a shell command, including operations hidden
+    behind newlines, `&`, $(...), backticks, `bash -c`, `eval`, `xargs` and sudo/env-style wrappers. Text inside
+    quotes and heredoc bodies is data, not a command. Not covered: a push through an alias, a script file or a
+    variable (the shell, not this hook, resolves those)."""
     writes: List[Dict[str, Any]] = []
-    for segment in SEGMENT_SPLIT.split(command or ""):
+    if depth > MAX_NESTING:
+        return writes
+    command = _strip_heredocs((command or "").replace("\\\n", " "))
+    for inner in _substitutions(command):
+        writes.extend(classify_bash(inner, cwd, depth + 1))
+    for segment in _split_top_level(command):
         try:
             argv = shlex.split(segment)
         except ValueError:
             argv = segment.split()
-        while argv and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]):  # leading VAR=value
-            argv = argv[1:]
+        argv = _strip_redirections(argv)
+        while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]) or argv[0] in WRAPPERS):
+            argv = argv[1:]  # leading VAR=value and sudo/env/command/... wrappers
         if not argv:
+            continue
+        if argv[0] in SHELLS:
+            for j, a in enumerate(argv[1:], start=1):
+                if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and j + 1 < len(argv):
+                    writes.extend(classify_bash(argv[j + 1], cwd, depth + 1))
+                    break
+            continue
+        if argv[0] == "eval":
+            writes.extend(classify_bash(" ".join(argv[1:]), cwd, depth + 1))
+            continue
+        if argv[0] == "xargs" and "git" in argv:
+            writes.extend(classify_bash(" ".join(argv[argv.index("git"):]), cwd, depth + 1))
             continue
         git_cwd = cwd
         sub_i = None
@@ -131,6 +237,11 @@ def classify_bash(command: str, cwd: Optional[str]) -> List[Dict[str, Any]]:
         elif argv[0] == "gh" and argv[1:3] == ["pr", "merge"]:
             writes.append({"tool": "merge_pull_request", "branch": f"pr:{argv[3] if len(argv) > 3 else '?'}",
                            "extra": [], "payload": None, "event": None})
+        elif argv[0] == "gh" and argv[1:3] == ["pr", "create"]:
+            head = next((argv[k + 1] for k, a in enumerate(argv) if a in ("--head", "-H") and k + 1 < len(argv)), None)
+            head = head or next((a.split("=", 1)[1] for a in argv if a.startswith("--head=")), None)
+            writes.append({"tool": "create_pull_request", "branch": head or _current_branch(cwd),
+                           "extra": [], "payload": None, "event": None})
     return writes
 
 
@@ -153,6 +264,16 @@ def classify_mcp(tool_name: str, tool_input: Dict[str, Any]) -> List[Dict[str, A
         event = str(ti.get("event", "")).upper() or None
         return [{"tool": short, "branch": f"pr:{ti.get('pullNumber', ti.get('pull_number', '?'))}",
                  "payload": str(ti.get("body", "")), "extra": [], "event": event}]
+    if short == "create_branch":
+        return [{"tool": "create_branch", "branch": str(ti.get("branch", "")), "payload": None, "extra": [],
+                 "event": None}]
+    if short in ("update_pull_request", "update_pull_request_branch"):
+        body = f"{ti.get('title', '')}\n{ti.get('body', '')}" if short == "update_pull_request" else None
+        return [{"tool": short, "branch": f"pr:{ti.get('pullNumber', ti.get('pull_number', '?'))}",
+                 "payload": body, "extra": [], "event": None}]
+    if short in ("actions_run_trigger", "run_workflow"):
+        return [{"tool": "run_workflow", "branch": str(ti.get("ref", "")), "payload": None, "extra": [],
+                 "event": None}]
     if short in ("add_issue_comment", "create_issue", "update_issue"):
         return [{"tool": "add_issue_comment", "branch": "issue", "payload": str(ti.get("body", "")),
                  "extra": [], "event": None}]
@@ -228,8 +349,13 @@ def respond(decisions: List["gem.GateDecision"], tool_name: str) -> Dict[str, An
         d = blocked[0]
         signer = (f" Verdict signed by ForgeCore (attestation {d.attestation.get('attestation_id')})."
                   if d.attestation else "")
+        no_signer = any(v.startswith(("No ForgeCore attestor", "ForgeCore attestation unavailable"))
+                        for v in d.violations)
+        hint = (" A different branch will not help: configure ForgeCore (AUTODEV_URL and AUTODEV_API_BEARER_TOKEN, "
+                "tunnel to autodev-server) or ask the user to push from a plain terminal."
+                if no_signer else " Use a feat/<slug> or fix/<issue>-<slug> branch and open a PR instead.")
         reason = (f"GitHubOpsGem blocked {d.tool_name} -> {d.target_branch}: " + "; ".join(d.violations)
-                  + signer + " Use a feat/<slug> or fix/<issue>-<slug> branch and open a PR instead.")
+                  + signer + hint)
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": reason}}
     if warned:
@@ -280,7 +406,10 @@ def main() -> int:
         writes = classify(event)
     except Exception as exc:  # noqa: BLE001 - a broken payload must not silently pass a write
         writes, event = [], {}
-        mode = gem.GemConfig.from_env().effective_mode()
+        try:
+            mode = gem.GemConfig.from_env().effective_mode()
+        except Exception:  # noqa: BLE001 - an unreadable config must not turn a broken payload into a pass
+            mode = gem.EnforcementMode.ENFORCE
         if mode == gem.EnforcementMode.ENFORCE and re.search(r"git\s+push|mcp__\w*github", raw):
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                      "permissionDecisionReason": f"Hook error, failing closed: {exc}"}}))
