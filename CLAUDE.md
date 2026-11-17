@@ -1,4 +1,4 @@
-# Operational Profile: DeepSeek V4.1 Flash (Fireworks serverless + B200 burst) + GitHubOpsGem v5.3 + aTRIZ-SWE
+# Operational Profile: DeepSeek V4.1 Flash (Fireworks serverless + B200 burst) + GitHubOpsGem + aTRIZ-SWE
 
 Repo-agnostic. Deployment identifiers live in the environment (`GEM_BURST_MODEL`, `GEM_REPOSITORY`), never in this file.
 
@@ -6,7 +6,7 @@ Repo-agnostic. Deployment identifiers live in the environment (`GEM_BURST_MODEL`
 - Client: Claude Code (Termux) → SSH/Tailscale tunnel → LiteLLM on awsbox (`127.0.0.1:8000`, master-key auth).
 - `ds-main` / `ds-fast` → Fireworks serverless DeepSeek V4.1 Flash 1017 (per token, always warm). `ds-burst` → the dedicated 4×B200 deployment, used only in heavy mode.
 - The B200 is woken only by the user (`gemctl heavy on`) or a ds-main 429 storm, sleeps 180 s after its last request, and is capped at $26/day and $78/week by the lifecycle controller. Never try to wake it, change its replicas or work around a cap yourself; if ds-burst is unavailable, continue on ds-main.
-- Gate verdicts are signed by ForgeCore (`autodev-server`, ADR-007). A gate block you did not get from ForgeCore is not evidence.
+- Gate verdicts are signed by ForgeCore (`autodev-server`, ADR-007). A gate block you did not get from ForgeCore is not evidence. In ENFORCE a write with no ForgeCore attestor configured is blocked; WARN keeps a local verdict that is not evidence.
 - Context: 131,072 window; enforced budget 96,000 input / 16,384 output (client auto-compact at 96k, proxy pre-call check).
 
 ## 2. Tool discipline

@@ -119,9 +119,9 @@ units:
     skill: null
     reviewer: null
 
-  - unit: WU-09b
-    queue_line: "WU-09b Git trailers"
-    facts: {human_gates: [H2], paths: [gem_trailers.py]}
+  - unit: autodev-pr55
+    queue_line: "Merge AutoDev PR #55"
+    facts: {human_gates: [H2], paths: []}
     gate_command: "python3 e2e_forgecore.py"
     depends_on: [H2]
     rule: R-GATED
@@ -189,7 +189,7 @@ units:
     queue_line: "WU-18 Evidence"
     facts: {external_write: true, human_gates: [H2, H5], paths: []}
     gate_command: "n/a (Linear writes need Aaron's confirmation)"
-    depends_on: [WU-06, WU-09b, H2, H5]
+    depends_on: [WU-06, autodev-pr55, H2, H5]
     rule: R-EXT
     owner_type: human
     agent: null

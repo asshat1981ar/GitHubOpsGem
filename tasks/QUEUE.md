@@ -11,7 +11,7 @@
 ## ⬜ Waiting on dependencies
 - [ ] WU-06 Conformance harness (needs live gateway on awsbox — human runs)
 - [ ] Install WU-08 hooks on Termux (`python3 install_hooks.py`) — starts the warn-week clock
-- [ ] WU-09b Git trailers carrying ForgeCore attestation_id (needs WU-08); merge AutoDev PR #55 after CI
+- [ ] Merge AutoDev PR #55 after CI and deploy it (human; the ADR-007 gate routes ForgeCore signing needs)
 - [ ] WU-10 Server-side gem-review workflow (needs WU-04; confirm before rulesets)
 - [ ] WU-11 Warn-week graduation report (needs WU-08 + 7 days)
 - [ ] WU-13 Opal Gem → report-only UI
@@ -34,5 +34,6 @@
 - [x] WU-07 deploy script `lifecycle/deploy_awsbox.sh` — idempotent install/upgrade/uninstall, 5 e2e tests; 190 tests
 - [x] WU-07 Lifecycle controller v1.0 — dry-run 9/9 (idle, SessionEnd, daily/weekly caps, stray wakes, 429 storm, guard); 181 tests
 - [x] AutoDev PR #56: CI setup-android fix (ported to #55)
+- [x] WU-09b Git trailers carrying the ForgeCore attestation_id (`gem_trailers.py`, `gemctl trailer`, tests/test_trailers.py)
 - [x] WU-09a ForgeCore attestation (ADR-007) — AutoDev PR #55 draft, gemcore v5.3 client, 5/5 e2e
 - [x] Decisions: serverless-first fast tier, no-wait cold starts, $10/day serverless + $26/day / $78/week B200 caps
