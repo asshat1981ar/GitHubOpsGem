@@ -211,8 +211,14 @@ def test_oversized_command_mentioning_a_push_is_not_waved_through():
     assert out and any("too long" in e for w in out for e in w["extra"])
 
 
-def test_oversized_command_without_a_push_is_ignored():
-    assert hook.classify_bash("echo " + "x" * 200_000, "/tmp") == []
+def test_oversized_command_is_gated_even_when_it_looks_harmless():
+    out = hook.classify_bash("echo " + "x" * 200_001, "/tmp")
+    assert out and any("too long" in e for w in out for e in w["extra"])
+
+
+def test_padding_cannot_hide_an_obfuscated_push_past_the_cap():
+    cmd = "#" + "a" * 200_001 + "\ngit pu''sh origin main"
+    assert hook.classify_bash(cmd, "/tmp")
 
 
 # ---------------------------------------------------------------- deny wording
@@ -233,4 +239,71 @@ def test_nesting_past_the_limit_fails_closed():
     deep = "$(" * 12 + "git push origin main" + ")" * 12
     out = hook.classify_bash(deep, "/tmp")
     assert out and any("too long" in e for w in out for e in w["extra"])
-    assert hook.classify_bash("$(" * 12 + "echo hi" + ")" * 12, "/tmp") == []
+    assert hook.classify_bash("$(" * 12 + "echo hi" + ")" * 12, "/tmp")  # too deep to follow: gated either way
+    assert hook.classify_bash("$(" * 4 + "echo hi" + ")" * 4, "/tmp") == []
+
+
+# ---------------------------------------------------------------- review round 3 (reviewer's confirmed probes)
+
+@pytest.mark.parametrize("cmd", [
+    "echo \"it's $(git push origin main)\"",
+    "echo \"it's `git push origin main`\"",
+    "cat <<EOF\nit's\n$(git push origin main)\nEOF",
+    "sudo -nu root git push origin main",
+    "sudo --user root git push origin main",
+    "timeout --signal KILL 5 git push origin main",
+    "env -S 'git push origin main'",
+    "env -iS 'git push origin main'",
+    "env --split-string='git push origin main'",
+    "env --chdir /tmp git push origin main",
+    "env --unset X git push origin main",
+    "nice --adjustment 5 git push origin main",
+    "su -c 'git push origin main'",
+    "find . -exec git push origin main \\;",
+    "flock /tmp/l git push origin main",
+    "watch git push origin main",
+    "<<EOF bash\ngit push origin main\nEOF",
+    "bash 2>&1 <<EOF\ngit push origin main\nEOF",
+    "cat <<EOF | bash\ngit push origin main\nEOF",
+    "git push $(echo origin) main",
+    "git $(echo -n) push origin main",
+    "git push origin foo#bar:main",
+    "git push origin a#b main",
+    "git push origin '>' main",
+])
+def test_round3_bypasses_reach_main(cmd):
+    assert ("git_push", "main") in writes(cmd), cmd
+
+
+def test_round3_gh_and_xargs_forms():
+    assert ("create_pull_request", "main") in writes("gh pr create --title '>' --head main")
+    assert any(t.startswith("git_") for t, _ in writes("echo main | xargs -I{} git push origin {}"))
+
+
+def test_documented_limits_stay_documented():
+    """Shell expansion and indirection the hook cannot resolve; the server-side ruleset covers these."""
+    assert writes("git pus{h,} origin main") == []
+    assert writes("git $'push' origin main") == []
+    assert writes("alias gp='git push'; gp origin main") == []
+    assert writes("ssh host git push origin main") == []
+
+
+@pytest.mark.parametrize("make", [
+    lambda: "cat " + "<<A " * 15_000,
+    lambda: "$(" * 30_000 + "git push origin main",
+    lambda: "(( x " + "<<A " * 12_000,
+    lambda: "<<-" * 20_000,
+    lambda: "git push origin " + "a" * 190_000,
+    lambda: "echo '" + "x" * 190_000,
+    lambda: 'echo "$(echo x)"' * 11_000,
+    lambda: "cat <<EOF\n" * 17_000,
+    lambda: "echo hi;" * 23_000,
+    lambda: "a'b\"" * 40_000,
+])
+def test_work_stays_bounded_just_under_the_cap(make):
+    import time
+    cmd = make()
+    assert len(cmd) <= hook.MAX_COMMAND_CHARS
+    t0 = time.monotonic()
+    hook.classify_bash(cmd, "/tmp")
+    assert time.monotonic() - t0 < 2.0

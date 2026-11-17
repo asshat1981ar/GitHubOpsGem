@@ -57,19 +57,20 @@ RULES: List[Tuple[str, str]] = [
 # --- shell classification limits and tables -------------------------------------------------------------------
 # The hook is a best-effort speed bump for an agent's own commands, not a shell parser. The enforcement that
 # cannot be bypassed from here is server-side (rulesets on main, the gem-review required check). Not covered:
-# aliases, scripts and variables the shell expands, `ssh host git push`, `echo ... | sh`, `git update-ref`,
-# `gh api` and other gh writes, interpreters (`python -c`).
-MAX_COMMAND_CHARS = 64_000
+# aliases, scripts, variables and brace/ANSI-C expansion (`git pus{h,}`, `git $'push'`), `ssh host git push`,
+# `git update-ref`, `gh api` and other gh writes, interpreters (`python -c`). A command we cannot parse (over the
+# size or nesting limit) is gated, not waved through.
+MAX_COMMAND_CHARS = 200_000
 MAX_NESTING = 8
+MAX_HEREDOC_CANDIDATES = 64
+PLACEHOLDER = "\x01"  # stands in for a $(...) / `...` that was lifted out of a command word
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 SCRIPT_READERS = SHELLS | {"eval", "source", "."}
-# wrapper -> options that consume the following token
-WRAPPERS: Dict[str, set] = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-r", "-t", "-T", "-U"}, "doas": {"-u", "-C"},
-    "env": {"-u", "-C", "-S"}, "command": set(), "exec": {"-a"}, "nohup": set(), "time": {"-f", "-o"},
-    "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k"}, "setsid": set(),
-    "stdbuf": {"-i", "-o", "-e"}, "builtin": set(),
-}
+# Commands that run another command. Their own options are not parsed: the wrapped command is the first later
+# word that is a command we recognise; quoted strings they swallow (env -S 'x', su -c 'x') are classified too.
+WRAPPERS = {"sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "ionice", "timeout", "setsid",
+            "stdbuf", "builtin", "su", "runuser", "flock", "watch", "busybox", "find", "parallel", "chroot", "strace"}
+COMMAND_WORDS = {"git", "gh", "eval", "xargs"} | SHELLS | WRAPPERS
 GRAMMAR = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"}
 XARGS_ARG_OPTS = {"-I", "-n", "-P", "-d", "-E", "-L", "-s", "-a", "-R", "-S"}
 PUSH_ARG_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
@@ -105,33 +106,50 @@ def _split_top_level(command: str) -> List[str]:
     return [x.strip() for x in segments if x.strip()]
 
 
-def _substitutions(command: str) -> List[str]:
-    """Bodies of $(...) and `...` outside single quotes (they run even inside double quotes)."""
-    found: List[str] = []
-    in_single = False
+def _extract_substitutions(command: str, quotes: bool = True) -> Tuple[str, List[str]]:
+    """Lift $(...) and `...` out of a command. Returns the text with each replaced by PLACEHOLDER (so the word it
+    sat in stays one word) and the lifted bodies. They run even inside double quotes, never inside single quotes;
+    an apostrophe inside double quotes is just text. `quotes=False` is for heredoc bodies, where no quote quotes."""
+    out: List[str] = []
+    bodies: List[str] = []
+    single = double = False
     i, n = 0, len(command)
     while i < n:
         c = command[i]
-        if c == "\\" and not in_single:
+        if c == "\\" and not single and i + 1 < n:
+            out.append(command[i:i + 2])
             i += 2
             continue
-        if c == "'":
-            in_single = not in_single
-        elif not in_single and command.startswith("$(", i):
+        if quotes and c == "'" and not double:
+            single = not single
+        elif quotes and c == '"' and not single:
+            double = not double
+        elif not single and command.startswith("$(", i):
             depth, j = 1, i + 2
             while j < n and depth:
                 depth += (command[j] == "(") - (command[j] == ")")
                 j += 1
-            found.append(command[i + 2:j - 1] if depth == 0 else command[i + 2:])
+            if depth:  # unterminated: everything after is the body (one pass, no rescans)
+                bodies.append(command[i + 2:])
+                out.append(PLACEHOLDER)
+                break
+            bodies.append(command[i + 2:j - 1])
+            out.append(PLACEHOLDER)
             i = j
             continue
-        elif not in_single and c == "`":
+        elif not single and c == "`":
             j = command.find("`", i + 1)
-            found.append(command[i + 1:j] if j != -1 else command[i + 1:])
+            bodies.append(command[i + 1:j] if j != -1 else command[i + 1:])
+            out.append(PLACEHOLDER)
             i = (j if j != -1 else n) + 1
             continue
+        out.append(c)
         i += 1
-    return found
+    return "".join(out), bodies
+
+
+def _substitutions(command: str, quotes: bool = True) -> List[str]:
+    return _extract_substitutions(command, quotes)[1]
 
 
 def _heredoc_body(command: str, i: int, delim: str, quoted: bool, dash: bool, script: bool) -> Tuple[int, Optional[str]]:
@@ -146,17 +164,18 @@ def _heredoc_body(command: str, i: int, delim: str, quoted: bool, dash: bool, sc
         return end.end(), command[i:end.end()]
     if quoted:
         return end.end(), ""
-    inner = _substitutions(body)
+    inner = _substitutions(body, quotes=False)
     return end.end(), ("\n".join(inner) + "\n") if inner else ""
 
 
 def _expand_heredocs(command: str) -> str:
     """Treat heredoc bodies as data, except for script readers and live substitutions. One pass, no rescans: an
-    unterminated heredoc leaves the rest as commands (fail closed) and stops looking for more."""
+    unterminated heredoc, or more than MAX_HEREDOC_CANDIDATES `<<`, leaves the rest as commands (fail closed)."""
     out: List[str] = []
     pending: List[Tuple[str, bool, bool, bool]] = []
     quote: Optional[str] = None
     give_up = False
+    candidates = 0
     line_start = 0
     i, n = 0, len(command)
     while i < n:
@@ -196,73 +215,109 @@ def _expand_heredocs(command: str) -> str:
             continue
         if not give_up and command.startswith("<<", i) and command[i + 2:i + 3] != "<" \
                 and (i == 0 or command[i - 1] != "<"):
-            before = command[line_start:i]
-            arithmetic = "((" in before and "))" not in before[before.rfind("(("):]
-            m = None if arithmetic else HEREDOC_OP.match(command, i)
-            if m:
-                words = _unwrap(re.split(r"[;&|()]", before)[-1].split())
-                receiver = os.path.basename(words[0]) if words else ""
-                pending.append((m.group(3) or m.group(4), bool(m.group(2)), bool(m.group(1)), receiver in SCRIPT_READERS))
-                out.append(m.group(0))
-                i = m.end()
-                continue
+            candidates += 1
+            if candidates > MAX_HEREDOC_CANDIDATES:
+                give_up = True
+            else:
+                eol = command.find("\n", i)
+                line = command[line_start:n if eol == -1 else eol]
+                before = command[line_start:i]
+                arithmetic = "((" in before and "))" not in before[before.rfind("(("):]
+                m = None if arithmetic else HEREDOC_OP.match(command, i)
+                if m:
+                    # the receiver can sit before or after the operator: `bash <<EOF`, `<<EOF bash`, `<<EOF | bash`
+                    words = {os.path.basename(w) for w in re.split(r"[\s;&|()]+", line)}
+                    pending.append((m.group(3) or m.group(4), bool(m.group(2)), bool(m.group(1)),
+                                    bool(words & SCRIPT_READERS)))
+                    out.append(m.group(0))
+                    i = m.end()
+                    continue
         out.append(c)
         i += 1
     return "".join(out)
 
 
-def _strip_redirections(argv: List[str]) -> List[str]:
-    """Drop `2>&1`, `> file`, `>>file`, `main>/dev/null` so they are not mistaken for refspecs."""
-    out: List[str] = []
+def _raw_words(segment: str) -> List[str]:
+    """Split on whitespace outside quotes, keeping the quotes in each word. One pass."""
+    words: List[str] = []
+    cur: List[str] = []
+    quote: Optional[str] = None
+    i, n = 0, len(segment)
+    while i < n:
+        c = segment[i]
+        if c == "\\" and quote != "'" and i + 1 < n:
+            cur.append(segment[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c in " \t\r\n":
+            if cur:
+                words.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if cur:
+        words.append("".join(cur))
+    return words
+
+
+def _tokens(segment: str) -> List[str]:
+    """Words of one command with redirections and comments removed. Redirections are recognised before quote
+    removal so a quoted '>' stays an argument."""
+    words: List[str] = []
     skip = False
-    for tok in argv:
+    for tok in _raw_words(segment):
+        if tok.startswith("#"):
+            break  # a comment runs to the end of the command
         if skip:
             skip = False
             continue
-        m = INLINE_REDIRECT.match(tok)
-        if not m:
-            out.append(tok)
-            continue
-        head, _op, target = m.groups()
-        if head:
-            out.append(head)
-        skip = not target  # a bare operator takes the next token as its target
-    return out
+        if tok[:1] not in ("'", '"'):
+            m = INLINE_REDIRECT.match(tok)
+            if m:
+                head, _op, target = m.groups()
+                if head:
+                    words.append(head)
+                skip = not target  # a bare operator takes the next token as its target
+                continue
+        try:
+            words.append("".join(shlex.split(tok)) if re.search(r"['\"\\]", tok) else tok)
+        except ValueError:
+            words.append(tok)
+    return words
 
 
-def _unwrap(argv: List[str]) -> List[str]:
-    """Strip leading VAR=value, shell grammar words and wrappers (sudo, env, timeout, ...) with their options."""
+def _unwrap(argv: List[str]) -> Tuple[List[str], List[str]]:
+    """Strip leading VAR=value, shell grammar words and wrappers. For a wrapper the wrapped command is the first
+    later word that is a command we recognise; whitespace-containing words it skips (env -S 'x', su -c 'x') are
+    returned so the caller classifies them as commands too."""
+    skipped: List[str] = []
     while argv:
         head = argv[0]
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", head) or head in GRAMMAR:
             argv = argv[1:]
             continue
-        name = os.path.basename(head)
-        if name not in WRAPPERS:
+        if os.path.basename(head) not in WRAPPERS:
             break
-        takes = WRAPPERS[name]
-        argv = argv[1:]
-        while argv and argv[0].startswith("-") and argv[0] != "--":
-            opt, argv = argv[0], argv[1:]
-            if opt in takes and argv:
-                argv = argv[1:]
-        if argv and argv[0] == "--":
-            argv = argv[1:]
-        if name == "timeout" and argv:
-            argv = argv[1:]  # the duration
-    return argv
+        rest = argv[1:]
+        k = next((m for m, w in enumerate(rest) if os.path.basename(w) in COMMAND_WORDS), len(rest))
+        skipped.extend(w.split("=", 1)[1] if w.startswith("-") and "=" in w else w
+                       for w in rest[:k] if re.search(r"\s", w))  # env --split-string='x' carries its value
+        argv = rest[k:]
+    return argv, skipped
 
 
-def _oversized(command: str, why: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Parsing is skipped above MAX_COMMAND_CHARS or MAX_NESTING (cost and hang risk). If the text still mentions a
-    push or a PR merge/create, gate it as an unparsed write instead of letting it through."""
-    note = (f"Command too long to classify ({why or f'> {MAX_COMMAND_CHARS} characters'}) "
-            "and it mentions a git push or PR write.")
-    if re.search(r"\bgit\b", command) and re.search(r"\bpush\b", command):
-        return [{"tool": "git_push", "branch": "unparsed", "extra": [note], "payload": None, "event": None}]
-    if re.search(r"\bgh\b", command) and re.search(r"\bpr\b", command) and re.search(r"\b(?:merge|create)\b", command):
-        return [{"tool": "merge_pull_request", "branch": "unparsed", "extra": [note], "payload": None, "event": None}]
-    return []
+def _unparsed(why: str) -> List[Dict[str, Any]]:
+    """A command we will not or cannot parse is gated as an unparsed write, never waved through. Large file
+    writes belong in the Write/Edit tools."""
+    note = f"Command too long to classify ({why}); split it, or use the Write/Edit tools for file contents."
+    return [{"tool": "git_push", "branch": "unparsed", "extra": [note], "payload": None, "event": None}]
 
 
 # --------------------------------------------------------------------------- classification
@@ -294,23 +349,22 @@ def _repo_slug(cwd: Optional[str]) -> str:
 def classify_bash(command: str, cwd: Optional[str], depth: int = 0) -> List[Dict[str, Any]]:
     """Return one write description per gated git/gh operation in a shell command, including operations behind
     newlines, `&`, parentheses, $(...), backticks, `bash -c`, here-strings, script heredocs, `eval`, `xargs` and
-    sudo/env/timeout-style wrappers. Quoted text and data heredocs are not commands. Limits: see the note above
+    wrappers (sudo, env, timeout, ...). Quoted text and data heredocs are not commands. Limits: see the note above
     MAX_COMMAND_CHARS."""
     command = command or ""
     if depth == 0 and len(command) > MAX_COMMAND_CHARS:
-        return _oversized(command)
+        return _unparsed(f"> {MAX_COMMAND_CHARS} characters")
+    if depth > MAX_NESTING:
+        return _unparsed(f"nested more than {MAX_NESTING} levels deep")
     writes: List[Dict[str, Any]] = []
-    if depth > MAX_NESTING:  # too deep to follow: gate it as an unparsed write if it still mentions a push
-        return _oversized(command, "nested more than %d levels deep" % MAX_NESTING)
-    command = _expand_heredocs(command.replace("\\\n", " "))
-    for inner in _substitutions(command):
+    text, bodies = _extract_substitutions(_expand_heredocs(command.replace("\\\n", " ")))
+    for inner in bodies:
         writes.extend(classify_bash(inner, cwd, depth + 1))
-    for segment in _split_top_level(command):
-        try:
-            raw = shlex.split(segment, comments=True)
-        except ValueError:
-            raw = segment.split()
-        argv = _unwrap(_strip_redirections(raw))
+    for segment in _split_top_level(text):
+        raw = _tokens(segment)
+        argv, skipped = _unwrap(raw)
+        for s in skipped:
+            writes.extend(classify_bash(s, cwd, depth + 1))
         if not argv:
             continue
         name = os.path.basename(argv[0])
@@ -340,7 +394,7 @@ def classify_bash(command: str, cwd: Optional[str], depth: int = 0) -> List[Dict
         sub_i = None
         if name == "git":
             i = 1
-            while i < len(argv) and argv[i].startswith("-"):
+            while i < len(argv) and (argv[i].startswith("-") or argv[i] == PLACEHOLDER):
                 if argv[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(argv):
                     if argv[i] == "-C":
                         git_cwd = os.path.join(cwd or os.getcwd(), argv[i + 1])
