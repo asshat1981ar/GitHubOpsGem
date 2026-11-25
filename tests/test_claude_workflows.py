@@ -251,5 +251,6 @@ def test_approval_check_fails_prs_that_edit_the_signal_workflow():
     assert "if" not in guard  # a failed guard must skip the check
     assert ".github/workflows/agent-approval-signal.yml" in guard["run"]
     assert "previous_filename" in guard["run"]  # renames are caught
+    assert "changed_files" in guard["run"]  # an incomplete file list blocks
     assert "context=agent-approval-check" in guard["run"] and "state=failure" in guard["run"]
     assert "${{" not in guard["run"]

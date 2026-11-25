@@ -53,8 +53,13 @@ jobs:
             pr="$(gh api "repos/$REPO/commits/$RUN_HEAD_SHA/pulls" --jq '[.[] | select(.state == "open")][0].number // empty')"
           fi
           [[ "$pr" =~ ^[0-9]+$ ]] || { echo "no pull request for this event"; exit 0; }
-          head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
-          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head commit of PR #$pr"; exit 1; }
+          # One read gives the head commit and the changed-file count. If it fails, fall back to the head
+          # commit named by the event, so a failure status still replaces any earlier success.
+          meta="$(gh api "repos/$REPO/pulls/$pr" --jq '"\(.head.sha) \(.changed_files)"' || true)"
+          head="${meta%% *}"; changed="${meta##* }"
+          # (Used only as the status target; nothing from the PR is checked out or run.)
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || head="$(jq -r '.pull_request.head.sha // .workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not determine the head commit of PR #$pr"; exit 1; }
           block() {
             gh api -X POST "repos/$REPO/statuses/$head" \
               -f state=failure -f context=agent-approval-check -f target_url="$RUN_URL" \
@@ -63,9 +68,14 @@ jobs:
             exit 1
           }
           # Both the new and the old path of every file, so a rename of the signal workflow is caught too.
-          if ! paths="$(gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[] | .filename, (.previous_filename // empty)')"; then
+          [[ "$changed" =~ ^[0-9]+$ ]] || block "Could not read the PR's details, so the approval check cannot run"
+          if ! files="$(gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[] | [.filename, (.previous_filename // "")] | @tsv')"; then
             block "Could not list the PR's files, so the approval check cannot run"
           fi
+          # The files endpoint stops at 3,000 entries; an incomplete list could hide the signal workflow.
+          listed="$(grep -c . <<<"$files" || true)"
+          (( listed >= changed )) || block "Only $listed of $changed changed files could be listed, so the approval check cannot run"
+          paths="$(tr '\t' '\n' <<<"$files")"
           if grep -qxF "$signal" <<<"$paths"; then
             block "This PR edits agent-approval-signal.yml; change it in its own PR"
           fi
