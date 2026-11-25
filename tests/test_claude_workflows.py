@@ -246,8 +246,10 @@ def test_approval_check_fails_prs_that_edit_the_signal_workflow():
     steps = wf["jobs"]["check"]["steps"]
     names = [s.get("name", "") for s in steps]
     guard = steps[names.index("Block PRs that edit the approval signal")]
-    assert names.index("Block PRs that edit the approval signal") > names.index("Check approvals")
-    assert guard.get("if") == "always()"
+    # Before the check, so a blocked PR never gets a success status, even briefly.
+    assert names.index("Block PRs that edit the approval signal") < names.index("Check approvals")
+    assert "if" not in guard  # a failed guard must skip the check
     assert ".github/workflows/agent-approval-signal.yml" in guard["run"]
+    assert "previous_filename" in guard["run"]  # renames are caught
     assert "context=agent-approval-check" in guard["run"] and "state=failure" in guard["run"]
     assert "${{" not in guard["run"]

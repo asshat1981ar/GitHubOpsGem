@@ -30,19 +30,12 @@ jobs:
       pull-requests: write
       statuses: write
     steps:
-      - name: Check approvals
-        uses: anthropics/claude-code-action/agent-approval-check@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
-        with:
-          required_approvals: "1"
-          agent_emails: noreply@anthropic.com
-          agent_logins: claude[bot],claude-code[bot]
-          protected_bases: main
       # pull_request_review runs agent-approval-signal from the PR's own merge ref, so a PR could drop its
-      # `dismissed` trigger and keep a stale success after an approval is dismissed. This step runs from the
-      # default branch after the check and turns the status to failure for any PR that edits the signal
-      # workflow. Change that file in its own PR while the ruleset is off (DEACTIVATE=agent-approval).
+      # `dismissed` trigger (or rename the file) and keep a stale success after an approval is dismissed.
+      # This step runs from the default branch BEFORE the check: if the PR touches the signal workflow
+      # under its new or old name, or the file lookup fails, it posts failure and the check never runs, so
+      # no success is posted. Change that file in its own PR while the ruleset is off (DEACTIVATE=agent-approval).
       - name: Block PRs that edit the approval signal
-        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -54,18 +47,33 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          signal='.github/workflows/agent-approval-signal.yml'
           pr="${PR_FROM_PR:-${PR_FROM_ISSUE:-${PR_FROM_RUN:-}}}"
           if [[ -z "$pr" && "$EVENT_NAME" == "workflow_run" && -n "$RUN_HEAD_SHA" ]]; then
             pr="$(gh api "repos/$REPO/commits/$RUN_HEAD_SHA/pulls" --jq '[.[] | select(.state == "open")][0].number // empty')"
           fi
           [[ "$pr" =~ ^[0-9]+$ ]] || { echo "no pull request for this event"; exit 0; }
           head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
-          if gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[].filename' \
-               | grep -qx '.github/workflows/agent-approval-signal.yml'; then
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the head commit of PR #$pr"; exit 1; }
+          block() {
             gh api -X POST "repos/$REPO/statuses/$head" \
               -f state=failure -f context=agent-approval-check -f target_url="$RUN_URL" \
-              -f description="This PR edits agent-approval-signal.yml; change it in its own PR [${head:0:12}]" >/dev/null
-            echo "::error::PR #$pr edits .github/workflows/agent-approval-signal.yml, so agent-approval-check is failed."
+              -f description="$1 [${head:0:12}]" >/dev/null
+            echo "::error::PR #$pr: $1"
             exit 1
+          }
+          # Both the new and the old path of every file, so a rename of the signal workflow is caught too.
+          if ! paths="$(gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[] | .filename, (.previous_filename // empty)')"; then
+            block "Could not list the PR's files, so the approval check cannot run"
           fi
-          echo "PR #$pr does not edit the approval signal workflow"
+          if grep -qxF "$signal" <<<"$paths"; then
+            block "This PR edits agent-approval-signal.yml; change it in its own PR"
+          fi
+          echo "PR #$pr does not touch the approval signal workflow"
+      - name: Check approvals
+        uses: anthropics/claude-code-action/agent-approval-check@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        with:
+          required_approvals: "1"
+          agent_emails: noreply@anthropic.com
+          agent_logins: claude[bot],claude-code[bot]
+          protected_bases: main
