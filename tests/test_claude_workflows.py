@@ -238,3 +238,16 @@ def test_verdict_uses_deterministic_count():
     run = load(WF_DIR / "claude-gem-verdict.yml")["jobs"]["verdict"]["steps"][-1]["run"]
     assert "totals.critical" in run and "no Claude verdict" in run
     assert "actor.login != 'dependabot[bot]'" in str(load(WF_DIR / "claude-gem-verdict.yml")["jobs"]["verdict"]["if"])
+
+
+def test_approval_check_fails_prs_that_edit_the_signal_workflow():
+    """Review events run agent-approval-signal from the PR, so the trusted check must fail PRs that edit it."""
+    wf = yaml.safe_load((WF_DIR / "agent-approval-check.yml").read_text(encoding="utf-8"))
+    steps = wf["jobs"]["check"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    guard = steps[names.index("Block PRs that edit the approval signal")]
+    assert names.index("Block PRs that edit the approval signal") > names.index("Check approvals")
+    assert guard.get("if") == "always()"
+    assert ".github/workflows/agent-approval-signal.yml" in guard["run"]
+    assert "context=agent-approval-check" in guard["run"] and "state=failure" in guard["run"]
+    assert "${{" not in guard["run"]

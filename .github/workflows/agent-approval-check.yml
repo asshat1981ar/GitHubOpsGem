@@ -37,3 +37,35 @@ jobs:
           agent_emails: noreply@anthropic.com
           agent_logins: claude[bot],claude-code[bot]
           protected_bases: main
+      # pull_request_review runs agent-approval-signal from the PR's own merge ref, so a PR could drop its
+      # `dismissed` trigger and keep a stale success after an approval is dismissed. This step runs from the
+      # default branch after the check and turns the status to failure for any PR that edits the signal
+      # workflow. Change that file in its own PR while the ruleset is off (DEACTIVATE=agent-approval).
+      - name: Block PRs that edit the approval signal
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_PR: ${{ github.event.pull_request.number }}
+          PR_FROM_ISSUE: ${{ github.event.issue.number }}
+          PR_FROM_RUN: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          pr="${PR_FROM_PR:-${PR_FROM_ISSUE:-${PR_FROM_RUN:-}}}"
+          if [[ -z "$pr" && "$EVENT_NAME" == "workflow_run" && -n "$RUN_HEAD_SHA" ]]; then
+            pr="$(gh api "repos/$REPO/commits/$RUN_HEAD_SHA/pulls" --jq '[.[] | select(.state == "open")][0].number // empty')"
+          fi
+          [[ "$pr" =~ ^[0-9]+$ ]] || { echo "no pull request for this event"; exit 0; }
+          head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
+          if gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[].filename' \
+               | grep -qx '.github/workflows/agent-approval-signal.yml'; then
+            gh api -X POST "repos/$REPO/statuses/$head" \
+              -f state=failure -f context=agent-approval-check -f target_url="$RUN_URL" \
+              -f description="This PR edits agent-approval-signal.yml; change it in its own PR [${head:0:12}]" >/dev/null
+            echo "::error::PR #$pr edits .github/workflows/agent-approval-signal.yml, so agent-approval-check is failed."
+            exit 1
+          fi
+          echo "PR #$pr does not edit the approval signal workflow"
