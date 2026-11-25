@@ -1,0 +1,94 @@
+# Requires a human approval on pull requests that contain agent-authored commits. Both triggers run the
+# workflow file from the default branch, so a PR cannot edit this check to approve itself. Native reviews
+# reach it through agent-approval-signal (a workflow_run, which also runs from the default branch).
+# Mark `agent-approval-check` as required with ci/rulesets/agent-approval.json after one green run.
+name: agent-approval-check
+on:
+  # zizmor: ignore[dangerous-triggers] -- no checkout, no PR code; composite action reads the event JSON and posts a commit status
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited, deleted]   # an edited or deleted /approve changes the count
+  # Review submissions and dismissals arrive through agent-approval-signal. workflow_run always runs this
+  # file from the default branch, so a PR still cannot edit the check that gates it.
+  # zizmor: ignore[dangerous-triggers] -- no checkout, no PR code, no artifacts read; the action only reads PR metadata
+  workflow_run:
+    workflows: [agent-approval-signal]
+    types: [completed]
+permissions: {}
+jobs:
+  check:
+    # issue_comment also fires on plain issues; skip those early.
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: agent-approval-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      # pull_request_review runs agent-approval-signal from the PR's own merge ref, so a PR could drop its
+      # `dismissed` trigger (or rename the file) and keep a stale success after an approval is dismissed.
+      # This step runs from the default branch BEFORE the check: if the PR touches the signal workflow
+      # under its new or old name, or the file lookup fails, it posts failure and the check never runs, so
+      # no success is posted. Change that file in its own PR while the ruleset is off (DEACTIVATE=agent-approval).
+      - name: Block PRs that edit the approval signal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_PR: ${{ github.event.pull_request.number }}
+          PR_FROM_ISSUE: ${{ github.event.issue.number }}
+          PR_FROM_RUN: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          signal='.github/workflows/agent-approval-signal.yml'
+          pr="${PR_FROM_PR:-${PR_FROM_ISSUE:-${PR_FROM_RUN:-}}}"
+          if [[ -z "$pr" && "$EVENT_NAME" == "workflow_run" && -n "$RUN_HEAD_SHA" ]]; then
+            pr="$(gh api "repos/$REPO/commits/$RUN_HEAD_SHA/pulls" --jq '[.[] | select(.state == "open")][0].number // empty')"
+          fi
+          [[ "$pr" =~ ^[0-9]+$ ]] || { echo "no pull request for this event"; exit 0; }
+          # One read gives the head commit and the changed-file count. If it fails, fall back to the head
+          # commit named by the event, so a failure status still replaces any earlier success.
+          meta=""
+          for delay in 0 5 15 30; do  # retried: an issue_comment event names no commit to fall back to
+            sleep "$delay"
+            meta="$(gh api "repos/$REPO/pulls/$pr" --jq '"\(.head.sha) \(.changed_files)"' || true)"
+            [[ "$meta" =~ ^[0-9a-f]{40}\ [0-9]+$ ]] && break
+          done
+          head="${meta%% *}"; changed="${meta##* }"
+          # (Used only as the status target; nothing from the PR is checked out or run.)
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || head="$(jq -r '.pull_request.head.sha // .workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not determine the head commit of PR #$pr"; exit 1; }
+          block() {
+            gh api -X POST "repos/$REPO/statuses/$head" \
+              -f state=failure -f context=agent-approval-check -f target_url="$RUN_URL" \
+              -f description="$1 [${head:0:12}]" >/dev/null
+            echo "::error::PR #$pr: $1"
+            exit 1
+          }
+          # Both the new and the old path of every file, so a rename of the signal workflow is caught too.
+          [[ "$changed" =~ ^[0-9]+$ ]] || block "Could not read the PR's details, so the approval check cannot run"
+          if ! files="$(gh api --paginate "repos/$REPO/pulls/$pr/files" --jq '.[] | [.filename, (.previous_filename // "")] | @tsv')"; then
+            block "Could not list the PR's files, so the approval check cannot run"
+          fi
+          # The files endpoint stops at 3,000 entries; an incomplete list could hide the signal workflow.
+          listed="$(grep -c . <<<"$files" || true)"
+          (( listed >= changed )) || block "Only $listed of $changed changed files could be listed, so the approval check cannot run"
+          paths="$(tr '\t' '\n' <<<"$files")"
+          if grep -qxF "$signal" <<<"$paths"; then
+            block "This PR edits agent-approval-signal.yml; change it in its own PR"
+          fi
+          echo "PR #$pr does not touch the approval signal workflow"
+      - name: Check approvals
+        uses: anthropics/claude-code-action/agent-approval-check@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        with:
+          required_approvals: "1"
+          agent_emails: noreply@anthropic.com
+          agent_logins: claude[bot],claude-code[bot]
+          protected_bases: main

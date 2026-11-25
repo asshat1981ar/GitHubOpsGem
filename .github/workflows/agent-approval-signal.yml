@@ -1,0 +1,19 @@
+# Signal for agent-approval-check. pull_request_review runs from the PR's merge ref, so a PR could edit
+# this file, which is why it does nothing but finish: agent-approval-check listens for its workflow_run,
+# which always runs the check from the default branch and recomputes the status there.
+name: agent-approval-signal
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+permissions: {}
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    concurrency:
+      group: agent-approval-signal-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions: {}
+    steps:
+      - name: Record the review event
+        run: echo "review signal recorded; agent-approval-check recomputes from the default branch"
