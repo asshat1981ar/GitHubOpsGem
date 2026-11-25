@@ -55,7 +55,12 @@ jobs:
           [[ "$pr" =~ ^[0-9]+$ ]] || { echo "no pull request for this event"; exit 0; }
           # One read gives the head commit and the changed-file count. If it fails, fall back to the head
           # commit named by the event, so a failure status still replaces any earlier success.
-          meta="$(gh api "repos/$REPO/pulls/$pr" --jq '"\(.head.sha) \(.changed_files)"' || true)"
+          meta=""
+          for delay in 0 5 15 30; do  # retried: an issue_comment event names no commit to fall back to
+            sleep "$delay"
+            meta="$(gh api "repos/$REPO/pulls/$pr" --jq '"\(.head.sha) \(.changed_files)"' || true)"
+            [[ "$meta" =~ ^[0-9a-f]{40}\ [0-9]+$ ]] && break
+          done
           head="${meta%% *}"; changed="${meta##* }"
           # (Used only as the status target; nothing from the PR is checked out or run.)
           [[ "$head" =~ ^[0-9a-f]{40}$ ]] || head="$(jq -r '.pull_request.head.sha // .workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
