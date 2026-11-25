@@ -16,6 +16,7 @@ on:
       - "gateway/**"
       - "ci/**"
       - ".github/**"
+      - ".claude/**"
       - "CLAUDE.md"
       - "state/SELF_PROMPT.md"
 permissions: {}

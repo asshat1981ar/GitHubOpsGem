@@ -9,7 +9,7 @@
       "Read(**/secrets/**)",
       "Read(./gateway/claude-gem.env)",
       "Read(./lifecycle/lifecycle.env)",
-      "Read(/etc/gem/**)",
+      "Read(//etc/gem/**)",
       "Read(~/.gem/**)",
       "Bash(python3 -I gemctl.py heavy:*)",
       "Bash(firectl:*)",
