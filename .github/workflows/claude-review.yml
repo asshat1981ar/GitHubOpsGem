@@ -50,9 +50,9 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: "claude[bot]"   # review PRs that @claude opens; no wildcard
           prompt: "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${{ github.event.pull_request.number }}"
           claude_args: |
-            --permission-mode auto
             --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
             --max-turns 25
             --allowedTools "Read,Glob,Grep,Task,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*)"

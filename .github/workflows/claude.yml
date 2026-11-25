@@ -90,7 +90,6 @@ jobs:
           include_comments_by_actor: "asshat1981ar,coderabbitai[bot]"
           exclude_comments_by_actor: "dependabot[bot],renovate[bot]"
           claude_args: |
-            --permission-mode auto
             --model ${{ vars.CLAUDE_MODEL || 'claude-opus-5-5' }}
             --max-turns 40
             --allowedTools "Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*)"

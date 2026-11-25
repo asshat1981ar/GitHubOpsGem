@@ -18,7 +18,7 @@ Four workflows run Claude Code on this repository. No Claude workflow is a requi
    - `CLAUDE_MODEL`: overrides the model in every workflow (defaults: `claude-opus-5-5` for `claude.yml`, `claude-sonnet-5-5` elsewhere).
    - `CLAUDE_RUNNER=ubuntu-24.04-firewall` once the egress-firewall runner is enrolled (`.github/egress-firewall.yaml`).
    - `CLAUDE_PAUSE=true` pauses every Claude job (kill switch).
-5. `ci/rulesets/agent-approval.json` ships with `"enforcement": "disabled"`, so `ci/apply_rulesets.sh` creates it inert. After one green run of `agent-approval-check`, change it to `"active"` and re-run the script. Do not activate it earlier: a required check that never reports blocks every merge.
+5. `ci/rulesets/agent-approval.json` ships with `"enforcement": "disabled"`, so `ci/apply_rulesets.sh` creates it inert. After one green run of `agent-approval-check`, run `ACTIVATE=agent-approval ./ci/apply_rulesets.sh`: it applies that ruleset as active without editing the committed file, so the tests that pin it as shipped disabled keep passing. Do not activate it earlier: a required check that never reports blocks every merge.
 
 ## Commands
 
@@ -37,7 +37,7 @@ Four workflows run Claude Code on this repository. No Claude workflow is a requi
 - `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` scrubs subprocess environments; the App token is also in `.git/config`, which `.claude/settings.json` denies Claude from reading.
 - `.claude/settings.json` has an empty `allow` list. Each workflow grants its own tools through `--allowedTools`; settings and flags are merged, so nothing broader is added by settings.
 - Agent-mode jobs (`claude-review.yml`, `claude-gem-verdict.yml`) cannot filter comments by author, so they do not allowlist `gh pr view` or `gh api` and list them (plus `gh issue view`, `gh search`, `gh pr comment`) in `--disallowedTools`.
-- `--permission-mode auto` sends unlisted tools to a safety classifier instead of denying them. `claude.yml` therefore also denies `python`, `python3`, `pytest`, `pip`, `bash`, `sh`, `make` and `gemctl` gate/heavy/trailer.
+- No workflow passes `--permission-mode`, so the action's default `acceptEdits` mode applies and any tool outside `--allowedTools` is refused rather than sent to a safety classifier. `claude.yml` still also denies `python`, `python3`, `pytest`, `pip`, `bash`, `sh`, `make` and `gemctl` gate/heavy/trailer as a second layer.
 - `ci/rulesets/main.json` protects only the default branch. `release/*` and `hotfix/*` have no ruleset, so `claude.yml` refuses PRs whose head is a protected ref and tells Claude never to push there.
 - `claude-gem-verdict.yml` reads `gem-review-results`, produced by the PR-head scan; that JSON is attacker-influenced data (same-repo branches only). Claude's job has no write permission; a separate `label` job holds `pull-requests: write`.
 - On the PR that introduces these files, review commands come from the base branch, so the first `claude-review` run has no `/review-pr` command.

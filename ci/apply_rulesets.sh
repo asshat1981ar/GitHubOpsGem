@@ -7,13 +7,23 @@
 # Rulesets on a PRIVATE repo are enforced only on GitHub Pro/Team/Enterprise; on the Free plan they are
 # enforced on public repos only.
 # A ruleset with "enforcement": "disabled" (agent-approval.json ships that way) is created/updated as
-# disabled and enforces nothing; flip it to "active" only after a green agent-approval-check run, then re-run. No GitHub CLI? Settings → Rules → Rulesets → New ruleset → Import a ruleset,
-# and pick each JSON file.
+# disabled and enforces nothing. After a green agent-approval-check run, activate it without editing the
+# committed file:   ACTIVATE=agent-approval ./ci/apply_rulesets.sh
+# (ACTIVATE takes a space-separated list of ruleset file names without .json.)
+# No GitHub CLI? Settings → Rules → Rulesets → New ruleset → Import a ruleset, and pick each JSON file.
 set -euo pipefail
 REPO="${1:-asshat1981ar/GitHubOpsGem}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 command -v gh >/dev/null || { echo "install the GitHub CLI first (Termux: pkg install gh)" >&2; exit 1; }
-for f in "$HERE"/rulesets/*.json; do
+ACTIVATE="${ACTIVATE:-}"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+for src in "$HERE"/rulesets/*.json; do
+  f="$src"
+  stem="$(basename "$src" .json)"
+  if [[ " $ACTIVATE " == *" $stem "* ]]; then
+    f="$TMP/$stem.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["enforcement"]="active"; json.dump(d,open(sys.argv[2],"w"))' "$src" "$f"
+  fi
   name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$f")"
   id="$(gh api "repos/$REPO/rulesets" --jq ".[] | select(.name == \"$name\") | .id" | head -1)"
   enf="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforcement","active"))' "$f")"

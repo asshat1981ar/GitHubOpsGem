@@ -1,5 +1,6 @@
 # Requires a human approval on pull requests that contain agent-authored commits. Both triggers run the
-# workflow file from the default branch, so a PR cannot edit this check to approve itself.
+# workflow file from the default branch, so a PR cannot edit this check to approve itself. Native reviews
+# reach it through agent-approval-signal (a workflow_run, which also runs from the default branch).
 # Mark `agent-approval-check` as required with ci/rulesets/agent-approval.json after one green run.
 name: agent-approval-check
 on:
@@ -7,7 +8,13 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
-    types: [created]
+    types: [created, edited, deleted]   # an edited or deleted /approve changes the count
+  # Review submissions and dismissals arrive through agent-approval-signal. workflow_run always runs this
+  # file from the default branch, so a PR still cannot edit the check that gates it.
+  # zizmor: ignore[dangerous-triggers] -- no checkout, no PR code, no artifacts read; the action only reads PR metadata
+  workflow_run:
+    workflows: [agent-approval-signal]
+    types: [completed]
 permissions: {}
 jobs:
   check:
@@ -16,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: agent-approval-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: agent-approval-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
       cancel-in-progress: true
     permissions:
       contents: read

@@ -75,13 +75,19 @@ class TestPolicy:
         for job in load(path)["jobs"].values():
             for s in claude_steps(job):
                 args = s["with"]["claude_args"]
-                for flag in ("--permission-mode auto", "--model", "--max-turns", "--allowedTools"):
+                for flag in ("--model", "--max-turns", "--allowedTools"):
                     assert flag in args, flag
+                # Keep the action's default acceptEdits mode: auto mode lets a safety reviewer
+                # approve commands outside --allowedTools.
+                assert "--permission-mode" not in args
 
     def test_forbidden_inputs_absent(self, path):
         text = path.read_text(encoding="utf-8")
-        for key in ("show_full_output", "allowed_non_write_users", "allowed_bots"):
+        for key in ("show_full_output", "allowed_non_write_users"):
             assert key not in text
+        bots = re.findall(r"allowed_bots:\s*\"?([^\"\n#]+)", text)
+        assert all(b.strip() == "claude[bot]" for b in bots), bots
+        assert not bots or path.name == "claude-review.yml"
 
     def test_kill_switch_and_dependabot_guard(self, path):
         for name, job in load(path)["jobs"].items():

@@ -53,7 +53,6 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: "/explain-gem-verdict RESULTS_DIR: ${{ runner.temp }}/gem-results RUN_ID: ${{ github.event.workflow_run.id }} PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}"
           claude_args: |
-            --permission-mode auto
             --model ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
             --max-turns 15
             --add-dir ${{ runner.temp }}/gem-results
