@@ -20,6 +20,17 @@ tag is held back. reasoning_content and thinking blocks are left alone. GEM_GUAR
 inside tool-call arguments. An error inside the guardrail is logged once and that stream (or response) then passes
 through unmodified; upstream errors propagate untouched. `proxy_handler_instance.stripped_blocks` counts removed
 blocks for metrics, `errors` counts fail-open events.
+
+Two request/response gates ported from gem-v5.8 (GC-001):
+  * async_pre_call_hook(user_api_key_dict, cache, data, call_type) rejects a request whose estimated input exceeds
+    the input budget (GEM_INPUT_BUDGET_TOKENS, default 96,000) with HTTP 400 and an Anthropic-shaped
+    invalid_request_error, and trips gemcore's loop breaker when a caller tags requests with _gem_call_signature.
+    The budget check is fail-closed and needs no gemcore; the loop breaker needs gemcore.
+  * Tool-call repair on non-streaming responses: a pseudo-XML or native-token tool call leaked into the text is
+    turned into a real tool call only for read-only tools (gemcore SAFE_REPAIR_TOOLS: Read, Grep, Glob, LS). A
+    privileged one (Bash, Edit, Write, merge_pull_request, ...) is removed from the text and named in a visible
+    [GEM_GUARDRAIL: blocked ...] notice, never emitted as an executable call. Streams are not repaired: leaked
+    markup stays plain text, which the client never executes. GEM_GUARDRAIL_TOOL_REPAIR=0 turns repair off.
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ import logging
 import os
 import sys
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 try:
     from litellm.integrations.custom_logger import CustomLogger
@@ -50,11 +61,11 @@ except Exception:  # noqa: BLE001
     _log = logging.getLogger("gem_guardrail")
 
 
-def _load_think_filter() -> Optional[type]:
-    """gemcore's ThinkStreamFilter: already imported, next to this file, its parent, $GEM_HOME/lib, $GEM_CORE_PATH."""
+def _load_gemcore() -> Optional[Any]:
+    """gemcore (mcp_reference_monitor): already imported, $GEM_CORE_PATH, next to this file, its parent, $GEM_HOME/lib."""
     mod = sys.modules.get("mcp_reference_monitor")
     if mod is not None and hasattr(mod, "ThinkStreamFilter"):
-        return mod.ThinkStreamFilter
+        return mod
     here = os.path.dirname(os.path.abspath(__file__))
     gem_home = os.path.expanduser(os.environ.get("GEM_HOME", "~/.gem"))
     for cand in (os.environ.get("GEM_CORE_PATH", ""), here, os.path.dirname(here), os.path.join(gem_home, "lib")):
@@ -66,14 +77,83 @@ def _load_think_filter() -> Optional[type]:
             mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
             sys.modules["mcp_reference_monitor"] = mod     # dataclasses need the module registered
             spec.loader.exec_module(mod)                    # type: ignore[union-attr]
-            return mod.ThinkStreamFilter
+            return mod
         except Exception:  # noqa: BLE001
             sys.modules.pop("mcp_reference_monitor", None)
     try:
-        from mcp_reference_monitor import ThinkStreamFilter
-        return ThinkStreamFilter
+        import mcp_reference_monitor as mod  # type: ignore[no-redef]
+        return mod
     except Exception:  # noqa: BLE001
         return None
+
+
+def _load_think_filter() -> Optional[type]:
+    """gemcore's ThinkStreamFilter, or None when gemcore can't be found."""
+    mod = _load_gemcore()
+    return getattr(mod, "ThinkStreamFilter", None) if mod is not None else None
+
+
+# ---------------------------------------------------------------- pre-call budget (ported from gem-v5.8)
+
+try:
+    from fastapi import HTTPException as _HTTPError    # the LiteLLM proxy turns this into a clean HTTP error
+except Exception:  # noqa: BLE001
+    _HTTPError = None  # type: ignore[assignment,misc]
+
+DEFAULT_INPUT_BUDGET_TOKENS = 96000
+
+
+class AnthropicContextError(*((_HTTPError,) if _HTTPError is not None else ()), ValueError):  # type: ignore[misc]
+    """Request rejected before it reaches Fireworks: input over budget, or the loop breaker tripped.
+
+    HTTP 400 with an Anthropic-shaped invalid_request_error. A fastapi HTTPException when fastapi is installed (as
+    it is with the LiteLLM proxy), so the proxy returns this status and body instead of a 500.
+    """
+
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        self.message = message
+        self.anthropic_payload = {"type": "error", "error": {"type": "invalid_request_error", "message": message}}
+        if _HTTPError is not None:
+            _HTTPError.__init__(self, status_code=status_code, detail=self.anthropic_payload)
+        else:
+            ValueError.__init__(self, message)
+        self.status_code = status_code
+
+    def __str__(self) -> str:
+        return self.message
+
+    def to_json(self) -> str:
+        return json.dumps(self.anthropic_payload)
+
+
+def estimate_input_tokens(data: Mapping) -> int:
+    """Deterministic estimate (~4 characters per token) of messages + system + tools; _gem_input_tokens overrides."""
+    if isinstance(data.get("_gem_input_tokens"), int):
+        return int(data["_gem_input_tokens"])
+    chars = 0
+    for msg in data.get("messages") or ():
+        content = msg.get("content", "") if isinstance(msg, Mapping) else msg
+        chars += len(content) if isinstance(content, str) else len(json.dumps(content, default=str))
+    for key in ("system", "tools"):
+        value = data.get(key)
+        if value:
+            chars += len(value) if isinstance(value, str) else len(json.dumps(value, default=str))
+    return max(1, (chars + 3) // 4)
+
+
+def format_rejected_repairs_notice(rejected: List[Mapping]) -> str:
+    if not rejected:
+        return ""
+    names = ", ".join(sorted({str(r.get("name", "unknown")) for r in rejected}))
+    return f"[GEM_GUARDRAIL: blocked unauthenticated text-to-tool repair for privileged tool(s): {names}]"
+
+
+def _input_budget_from_env() -> int:
+    try:
+        value = int(os.environ.get("GEM_INPUT_BUDGET_TOKENS", DEFAULT_INPUT_BUDGET_TOKENS))
+    except ValueError:
+        return DEFAULT_INPUT_BUDGET_TOKENS
+    return value if value > 0 else DEFAULT_INPUT_BUDGET_TOKENS
 
 
 _SSE_FIELDS = (b"event:", b"data:", b":", b"id:", b"retry:")
@@ -351,15 +431,43 @@ class _Stream:
 class GemGuardrail(CustomLogger):
     """Strips <think>...</think> from visible text (and tool-call arguments) on every proxied response."""
 
-    def __init__(self, filter_cls: Optional[type] = None, **kwargs: Any) -> None:
+    def __init__(self, filter_cls: Optional[type] = None, input_budget_tokens: Optional[int] = None,
+                 allowed_repair_tools: Optional[Set[str]] = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.filter_cls = filter_cls or _load_think_filter()
+        gemcore = _load_gemcore()
+        self.filter_cls = filter_cls or (getattr(gemcore, "ThinkStreamFilter", None) if gemcore else None)
         self.strip_tool_args = os.environ.get("GEM_GUARDRAIL_TOOL_ARGS", "1") != "0"
+        self.repair_tools = os.environ.get("GEM_GUARDRAIL_TOOL_REPAIR", "1") != "0"
+        self.input_budget_tokens = input_budget_tokens or _input_budget_from_env()
+        sanitizer_cls = getattr(gemcore, "DeepSeekProtocolSanitizer", None) if gemcore else None
+        self.sanitizer = sanitizer_cls() if sanitizer_cls is not None else None
+        default_tools = getattr(sanitizer_cls, "SAFE_REPAIR_TOOLS", set()) if sanitizer_cls is not None else set()
+        self.allowed_repair_tools = set(allowed_repair_tools) if allowed_repair_tools is not None else set(default_tools)
         self.stripped_blocks = 0
         self.errors = 0
+        self.rejected_requests = 0
+        self.repaired_calls = 0
+        self.blocked_repairs = 0
         if self.filter_cls is None:
             _log.error("gem_guardrail: gemcore ThinkStreamFilter not found (put mcp_reference_monitor.py next to "
                        "gem_guardrail.py or set GEM_CORE_PATH); <think> stripping is OFF")
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        """Fail-closed input budget, then gemcore's loop breaker for requests tagged with _gem_call_signature."""
+        if not isinstance(data, Mapping):
+            return data
+        tokens = estimate_input_tokens(data)
+        if tokens > self.input_budget_tokens:
+            self.rejected_requests += 1
+            raise AnthropicContextError(f"Context budget exceeded: {tokens} > {self.input_budget_tokens} input cap.")
+        call_sig = str(data.get("_gem_call_signature") or "")
+        if call_sig and self.sanitizer is not None:
+            verdict = self.sanitizer.route_and_check_circuit_breaker(
+                tool_name=str(data.get("_gem_tool_name") or "Edit"), prompt_tokens=tokens, call_signature=call_sig)
+            if not verdict.get("allowed", True):
+                self.rejected_requests += 1
+                raise AnthropicContextError(str(verdict.get("reason") or "Loop circuit breaker tripped."))
+        return data
 
     async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
         if self.filter_cls is None:
@@ -374,7 +482,7 @@ class GemGuardrail(CustomLogger):
             yield out
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
-        if self.filter_cls is None:
+        if self.filter_cls is None and not self._can_repair():
             return None
         try:
             plan = self._plan_response(response)
@@ -386,14 +494,43 @@ class GemGuardrail(CustomLogger):
         if not plan:
             return None
         for target, key, value, blocks in plan:
-            _set(target, key, value)
+            if key is None:
+                target.extend(value)                        # new tool_use blocks after an Anthropic message's content
+            else:
+                _set(target, key, value)
             self.stripped_blocks += blocks
         return response
 
     # ------------------------------------------------------------------ non-streaming
     def _strip(self, text: str) -> Tuple[str, int]:
+        if self.filter_cls is None:
+            return text, 0
         f = self.filter_cls()
         return f.feed(text) + f.flush(), f.stripped_blocks
+
+    # ------------------------------------------------------------------ tool-call repair (non-streaming)
+    def _can_repair(self) -> bool:
+        return self.repair_tools and self.sanitizer is not None
+
+    def _repair(self, text: str) -> Optional[Tuple[str, List[dict], List[dict]]]:
+        """(cleaned text, allowlisted tool_use blocks, rejected blocks), or None when the text holds no tool markup."""
+        if not self._can_repair():
+            return None
+        san = type(self.sanitizer)
+        if not (san.PSEUDO_XML_TOOL_RE.search(text) or san.NATIVE_TOOL_RE.search(text)):
+            return None
+        cleaned, repaired, rejected = san.repair_tool_calls_detailed(text, allowed_tools=self.allowed_repair_tools)
+        notice = format_rejected_repairs_notice(rejected)
+        if notice:
+            cleaned = f"{cleaned}\n{notice}" if cleaned else notice
+        self.repaired_calls += len(repaired)
+        self.blocked_repairs += len(rejected)
+        return cleaned, repaired, rejected
+
+    @staticmethod
+    def _openai_call(block: Mapping) -> dict:
+        return {"id": block["id"], "type": "function",
+                "function": {"name": block["name"], "arguments": json.dumps(block.get("input") or {})}}
 
     def _plan_response(self, response: Any) -> List[Tuple[Any, str, Any, int]]:
         """Work out every change first, so a failure part-way leaves the response untouched."""
@@ -407,6 +544,14 @@ class GemGuardrail(CustomLogger):
                 content = _get(msg, "content")
                 if isinstance(content, str) and content:
                     new, n = self._strip(content)
+                    fixed = self._repair(new)
+                    if fixed is not None:
+                        new, repaired, _ = fixed
+                        if repaired:
+                            calls = list(_get(msg, "tool_calls") or []) + [self._openai_call(b) for b in repaired]
+                            plan.append((msg, "tool_calls", calls, 0))
+                            if _get(choice, "finish_reason") == "stop":
+                                plan.append((choice, "finish_reason", "tool_calls", 0))
                     if new != content:
                         plan.append((msg, "content", new, n))
                 for call in (_get(msg, "tool_calls") or []) if self.strip_tool_args else []:
@@ -419,12 +564,17 @@ class GemGuardrail(CustomLogger):
             return plan
         blocks = _get(response, "content")
         if isinstance(blocks, list):                       # Anthropic message
+            new_blocks: List[dict] = []
             for block in blocks:
                 btype = _get(block, "type")
                 if btype == "text":
                     text = _get(block, "text")
                     if isinstance(text, str) and text:
                         new, n = self._strip(text)
+                        fixed = self._repair(new)
+                        if fixed is not None:
+                            new, repaired, _ = fixed
+                            new_blocks.extend(dict(b) for b in repaired)
                         if new != text:
                             plan.append((block, "text", new, n))
                 elif btype in ("tool_use", "server_tool_use") and self.strip_tool_args:
@@ -437,6 +587,10 @@ class GemGuardrail(CustomLogger):
                                 plan.append((block, "input", json.loads(new), n))
                             except ValueError:
                                 pass                         # stripping broke the JSON: keep the original input
+            if new_blocks:
+                plan.append((blocks, None, new_blocks, 0))
+                if _get(response, "stop_reason") == "end_turn":
+                    plan.append((response, "stop_reason", "tool_use", 0))
         return plan
 
 

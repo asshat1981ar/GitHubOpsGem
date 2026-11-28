@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UnifiedExecutionEnvelopeV5",
+  "type": "object",
+  "required": [
+    "objective_id",
+    "deployment_id",
+    "workflow_phase",
+    "target_branch",
+    "quarantine_receipt",
+    "abi_receipt",
+    "atriz_mutation_receipt",
+    "tech_debt_report",
+    "pre_flight_gate"
+  ],
+  "properties": {
+    "objective_id": {
+      "type": "string",
+      "pattern": "^(PRO-[0-9]+|obj_[a-f0-9]{12})$"
+    },
+    "deployment_id": {
+      "type": "string",
+      "const": "accounts/YOUR_ACCOUNT/deployments/YOUR_DEPLOYMENT"
+    },
+    "workflow_phase": {
+      "type": "string",
+      "enum": [
+        "DISCOVER",
+        "INGEST",
+        "GRAPH",
+        "ANALYZE",
+        "GATE",
+        "COMMIT",
+        "RECOVER"
+      ]
+    },
+    "target_branch": {
+      "type": "string",
+      "pattern": "^(feat|fix|sprint)/[a-z0-9._-]+$"
+    },
+    "quarantine_receipt": {
+      "type": "object",
+      "required": [
+        "nfkc_normalized",
+        "unicode_tags_stripped",
+        "injection_alerts",
+        "think_blocks_stripped"
+      ],
+      "properties": {
+        "nfkc_normalized": {
+          "type": "boolean",
+          "const": true
+        },
+        "unicode_tags_stripped": {
+          "type": "boolean",
+          "const": true
+        },
+        "injection_alerts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "think_blocks_stripped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "abi_receipt": {
+      "type": "object",
+      "required": [
+        "required_symbols",
+        "verified_symbols",
+        "all_callers_verified"
+      ],
+      "properties": {
+        "required_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verified_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "all_callers_verified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "atriz_mutation_receipt": {
+      "type": "object",
+      "required": [
+        "improving_param",
+        "worsening_param",
+        "inventive_principle",
+        "code_diff_sha256",
+        "ideality_score",
+        "rice_score",
+        "fmea_rpn",
+        "lats_uct"
+      ],
+      "properties": {
+        "improving_param": {
+          "type": "string"
+        },
+        "worsening_param": {
+          "type": "string"
+        },
+        "inventive_principle": {
+          "type": "string"
+        },
+        "code_diff_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "ideality_score": {
+          "type": "number",
+          "minimum": 0
+        },
+        "rice_score": {
+          "type": "number",
+          "minimum": 0
+        },
+        "fmea_rpn": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "lats_uct": {
+          "type": "number"
+        }
+      }
+    },
+    "tech_debt_report": {
+      "type": "object",
+      "required": [
+        "psc_score",
+        "aup_score",
+        "dur_score",
+        "detected_debts"
+      ],
+      "properties": {
+        "psc_score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "aup_score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "dur_score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "detected_debts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "pre_flight_gate": {
+      "type": "object",
+      "required": [
+        "gate_decision",
+        "inline_comments_count",
+        "fallback_body_count"
+      ],
+      "properties": {
+        "gate_decision": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "BLOCK"
+          ]
+        },
+        "inline_comments_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fallback_body_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

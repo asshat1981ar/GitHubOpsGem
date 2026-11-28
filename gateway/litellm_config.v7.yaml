@@ -86,13 +86,9 @@ litellm_settings:
   # WU-05: gem_guardrail strips <think>...</think> from streamed and non-streamed output (/chat/completions and
   # /v1/messages). Sits next to this config with mcp_reference_monitor.py beside it (or in $GEM_HOME/lib).
   callbacks: [gem_lifecycle_callback.proxy_handler_instance, gem_guardrail.proxy_handler_instance]
-  # guardrails: enable after WU-05 (gem_guardrail.py) ships and passes conformance
-  # guardrails:
-  #   - guardrail_name: gem-protocol
-  #     litellm_params:
-  #       guardrail: gem_guardrail.GemProtocolGuardrail
-  #       mode: pre_call
-  #       default_on: true
+  # The same gem_guardrail callback also rejects input over GEM_INPUT_BUDGET_TOKENS (default 96,000) before the call
+  # (HTTP 400, Anthropic invalid_request_error) and repairs leaked read-only tool calls in non-streaming responses.
+  # No separate guardrails: block is needed. Check with: python3 gateway/conformance_check.py
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
